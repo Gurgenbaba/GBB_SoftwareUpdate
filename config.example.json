@@ -1,0 +1,135 @@
+{
+  "company_name": "GBB Beispiel GmbH",
+  "enabled_standard_software": [
+    "citrix_workspace",
+    "adobe_reader",
+    "teamviewer",
+    "microsoft_teams",
+    "office365business",
+    "opentext",
+    "avaya_workplace",
+    "filezilla",
+    "firefox"
+  ],
+  "internal_installers": {
+    "avaya": {
+      "path": "\\\\fileserver\\software\\Avaya\\AvayaWorkplaceSetup.exe",
+      "silent_args": "/S",
+      "display_name": "Avaya Workplace"
+    },
+    "opentext": {
+      "path": "\\\\fileserver\\software\\OpenText\\OpenTextSetup.exe",
+      "silent_args": "/quiet /norestart",
+      "display_name": "OpenText"
+    }
+  },
+  "software_providers": {
+    "citrix_workspace": {
+      "enabled": true,
+      "display_name": "Citrix Workspace",
+      "choco_package": "citrix-workspace",
+      "winget_id": "Citrix.Workspace",
+      "internal_installer": {
+        "path": "",
+        "silent_args": ""
+      },
+      "search_terms": ["citrix workspace", "citrix"]
+    },
+    "adobe_reader": {
+      "enabled": true,
+      "display_name": "Adobe Acrobat Reader",
+      "choco_package": "adobereader",
+      "winget_id": "Adobe.Acrobat.Reader.64-bit",
+      "internal_installer": {
+        "path": "",
+        "silent_args": ""
+      },
+      "search_terms": ["adobe reader", "acrobat reader"]
+    },
+    "teamviewer": {
+      "enabled": true,
+      "display_name": "TeamViewer",
+      "choco_package": "teamviewer",
+      "winget_id": "TeamViewer.TeamViewer",
+      "internal_installer": {
+        "path": "",
+        "silent_args": ""
+      },
+      "search_terms": ["teamviewer"]
+    },
+    "microsoft_teams": {
+      "enabled": true,
+      "display_name": "Microsoft Teams",
+      "choco_package": "microsoft-teams",
+      "winget_id": "Microsoft.Teams",
+      "internal_installer": {
+        "path": "",
+        "silent_args": ""
+      },
+      "search_terms": ["microsoft teams", "teams"]
+    },
+    "office365business": {
+      "enabled": true,
+      "display_name": "Microsoft 365 Business",
+      "choco_package": "Office365Business",
+      "winget_id": "Microsoft.Office",
+      "internal_installer": {
+        "path": "",
+        "silent_args": ""
+      },
+      "search_terms": ["office 365 business", "m365", "microsoft 365"]
+    },
+    "opentext": {
+      "enabled": true,
+      "display_name": "OpenText",
+      "choco_package": "",
+      "winget_id": "",
+      "internal_installer": {
+        "path": "\\\\fileserver\\software\\OpenText\\OpenTextSetup.exe",
+        "silent_args": "/quiet /norestart"
+      },
+      "search_terms": ["opentext", "open text"]
+    },
+    "avaya_workplace": {
+      "enabled": true,
+      "display_name": "Avaya Workplace",
+      "choco_package": "",
+      "winget_id": "Avaya.AvayaWorkplace",
+      "internal_installer": {
+        "path": "\\\\fileserver\\software\\Avaya\\AvayaWorkplaceSetup.exe",
+        "silent_args": "/S"
+      },
+      "search_terms": ["avaya workplace", "avaya"]
+    },
+    "filezilla": {
+      "enabled": true,
+      "display_name": "FileZilla",
+      "choco_package": "filezilla",
+      "winget_id": "TimKosse.FileZilla.Client",
+      "internal_installer": {
+        "path": "",
+        "silent_args": ""
+      },
+      "search_terms": ["filezilla"]
+    },
+    "firefox": {
+      "enabled": true,
+      "display_name": "Firefox",
+      "choco_package": "firefox",
+      "winget_id": "Mozilla.Firefox",
+      "internal_installer": {
+        "path": "",
+        "silent_args": ""
+      },
+      "search_terms": ["firefox", "mozilla firefox"]
+    }
+  },
+  "chocolatey_source": {
+    "name": "chocolatey",
+    "url": "https://community.chocolatey.org/api/v2/"
+  },
+  "local_source": {
+    "last_path": "",
+    "prefer_local": true
+  }
+}

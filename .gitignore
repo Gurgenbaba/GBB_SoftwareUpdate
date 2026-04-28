@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtual environments
+.venv/
+
+# Build artifacts
+build/
+dist/
+
+# Runtime logs (lokal / nach Build)
+logs/
+*.log
+
+# Lokale Laufzeit-Konfiguration (Audit: config.example.json)
+config.json
+
+# IDE
+.idea/
+.vscode/
