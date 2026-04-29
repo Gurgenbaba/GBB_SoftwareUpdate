@@ -40,6 +40,9 @@ INSTALL_TIMEOUT_SECONDS = 1800
 
 AVAYA_INSTALLER_SOURCE = r"\\fileserver\software\Avaya\AvayaWorkplaceSetup.exe"
 OPENTEXT_INSTALLER_SOURCE = r"\\fileserver\software\OpenText\OpenTextSetup.exe"
+# OpenText Core Endpoint Protection (Webroot): generischer Agent-Download; Site-Keycode = Dateiname laut Hersteller.
+OPENTEXT_ENDPOINT_INSTALLER_URL = "https://anywhere.webrootcloudav.com/zerol/wsasme.exe"
+# Legacy (Windows XP/2003): https://anywhere.webrootcloudav.com/zerol/wsasmefnl.exe
 
 MAX_CHOCO_RETRIES = 2
 
@@ -54,6 +57,14 @@ INTERNAL_INSTALLERS = {
         "silent_args": "/quiet /norestart",
         "display_name": "OpenText",
     },
+    "opentext_endpoint": {
+        "path": OPENTEXT_ENDPOINT_INSTALLER_URL,
+        "silent_args": "",
+        "type": "exe",
+        "response_file": "",
+        "display_name": "OpenText Core Endpoint Protection",
+        "endpoint_keycode": "",
+    },
 }
 
 SOFTWARE_ALIASES: dict[str, tuple[str, ...]] = {
@@ -63,6 +74,13 @@ SOFTWARE_ALIASES: dict[str, tuple[str, ...]] = {
     "microsoft_teams": ("microsoft teams", "ms teams", "teams machine-wide", "teams work or school"),
     "office365business": ("microsoft 365", "office", "office365", "m365", "o365"),
     "opentext": ("opentext", "open text", "opentext content"),
+    "opentext_core_endpoint": (
+        "webroot",
+        "secureanywhere",
+        "opentext core endpoint",
+        "core endpoint protection",
+        "wsasme",
+    ),
     "avaya_workplace": ("avaya", "avaya workplace", "workplace"),
     "filezilla": ("filezilla", "file zilla"),
     "firefox": ("firefox", "mozilla", "mozilla firefox"),
@@ -133,6 +151,17 @@ SOFTWARE_CATALOG: tuple[SoftwarePackage, ...] = (
         installer_source=OPENTEXT_INSTALLER_SOURCE,
         internal_installer_key="opentext",
         allow_dynamic_search=True,
+    ),
+    SoftwarePackage(
+        key="opentext_core_endpoint",
+        display_name="OpenText Core Endpoint Protection",
+        primary_package=None,
+        winget_id=None,
+        search_terms=("webroot", "secureanywhere", "opentext endpoint", "core endpoint"),
+        registry_keywords=("webroot", "secureanywhere", "opentext", "endpoint protection", "wsa"),
+        installer_source=OPENTEXT_ENDPOINT_INSTALLER_URL,
+        internal_installer_key="opentext_endpoint",
+        allow_dynamic_search=False,
     ),
     SoftwarePackage(
         key="avaya_workplace",

@@ -480,6 +480,13 @@ class UninstallerService:
                 r"{APPDATA}\OpenText",
                 r"{LOCALAPPDATA}\OpenText",
             ],
+            "opentext_core_endpoint": [
+                r"{PROGRAMFILES}\Webroot",
+                r"{PROGRAMFILESX86}\Webroot",
+                r"{PROGRAMDATA}\WRData",
+                r"{APPDATA}\Webroot",
+                r"{LOCALAPPDATA}\Webroot",
+            ],
             "avaya_workplace": [
                 r"{PROGRAMFILES}\Avaya",
                 r"{PROGRAMFILESX86}\Avaya",
@@ -582,6 +589,7 @@ class UninstallerService:
             "microsoft_teams": ["*teams*.exe", "*ms-teams*.exe", "*teamsbootstrapper*.exe"],
             "office365business": ["*officeclicktorun*.exe", "*winword.exe", "*excel.exe", "*powerpnt.exe"],
             "opentext": ["*opentext*.exe", "*edir*.exe", "*ndstrace*.exe"],
+            "opentext_core_endpoint": ["*wr*.exe", "*webroot*.exe", "*wsa*.exe"],
             "avaya_workplace": ["*avaya*.exe", "*workplace*.exe"],
             "filezilla": ["*filezilla*.exe"],
             "firefox": ["*firefox*.exe", "*updater.exe"],

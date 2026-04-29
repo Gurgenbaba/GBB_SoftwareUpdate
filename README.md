@@ -64,6 +64,7 @@ Beispiele:
 
 - **Avaya Workplace**: `winget_id = Avaya.AvayaWorkplace` (wenn Choco fehlt)
 - **OpenText**: bei produktabhängiger Lage internen Installerpfad setzen; ohne Quelle => `Quelle erforderlich`
+- **OpenText Core Endpoint Protection (Webroot-Agent)**: Standard-URL `https://anywhere.webrootcloudav.com/zerol/wsasme.exe`; für **stilles Hintergrund-Setup** den **Site-Keycode** aus der Management Console als `internal_installer.endpoint_keycode` hinterlegen (Format `XXXX-XXXX-XXXX-XXXX-XXXX`). Der Agent wird nach Download in genau diese **`.exe`-Datei umbenannt** und gestartet (wie in der Herstellerdoku). Alternativ lokal die von der Console heruntergeladene Keycode-EXE angeben. (Sehr alte Systeme: Hersteller-Link `wsasmefnl.exe` — hier nicht als Standard gesetzt.)
 - **Avaya / OpenText MSI (Beispiel)**:
   - `internal_installer.path = \\fileserver\software\Avaya\AvayaWorkplaceSetup.msi`
   - `internal_installer.type = msi`

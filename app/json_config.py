@@ -23,6 +23,7 @@ DEFAULT_EXAMPLE_CONFIG: dict[str, Any] = {
         "microsoft_teams",
         "office365business",
         "opentext",
+        "opentext_core_endpoint",
         "avaya_workplace",
         "filezilla",
         "firefox",
@@ -41,6 +42,14 @@ DEFAULT_EXAMPLE_CONFIG: dict[str, Any] = {
             "type": "auto",
             "response_file": "",
             "display_name": "OpenText",
+        },
+        "opentext_endpoint": {
+            "path": "https://anywhere.webrootcloudav.com/zerol/wsasme.exe",
+            "silent_args": "",
+            "type": "exe",
+            "response_file": "",
+            "display_name": "OpenText Core Endpoint Protection",
+            "endpoint_keycode": "",
         },
     },
     "software_providers": {},
@@ -90,6 +99,7 @@ def default_software_providers() -> dict[str, Any]:
                 "silent_args": "",
                 "type": "auto",
                 "response_file": "",
+                **({"endpoint_keycode": ""} if s.key == "opentext_core_endpoint" else {}),
             },
             "search_terms": list(s.search_terms),
             "local_patterns": [],
@@ -180,9 +190,12 @@ def _merge_internal_installers(overrides: Any) -> dict[str, dict[str, Any]]:
     if not isinstance(overrides, dict):
         return merged
     for key, data in overrides.items():
-        if key not in merged or not isinstance(data, dict):
+        if not isinstance(data, dict):
             continue
-        for field in ("path", "silent_args", "type", "response_file", "display_name"):
+        if key not in merged:
+            merged[key] = deepcopy(data)
+            continue
+        for field in ("path", "silent_args", "type", "response_file", "display_name", "endpoint_keycode"):
             if field in data and data[field] is not None:
                 merged[key][field] = data[field]
     return merged

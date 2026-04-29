@@ -492,7 +492,13 @@ class UpdaterApp(ctk.CTk):
 
             var = ctk.BooleanVar(value=False)
             self.checkbox_vars[key] = var
-            row_name = f"{software.display_name} (Server-Komponente (interner Installer))" if key == "opentext" else software.display_name
+            row_name = (
+                f"{software.display_name} (Server-Komponente (interner Installer))"
+                if key == "opentext"
+                else f"{software.display_name} (Webroot-Agent; Keycode aus Console)"
+                if key == "opentext_core_endpoint"
+                else software.display_name
+            )
             ctk.CTkCheckBox(rowf, text=row_name, variable=var, width=180, font=ctk.CTkFont(size=10)).grid(
                 row=0, column=0, sticky="w", padx=2, pady=0
             )
@@ -1649,7 +1655,17 @@ class UpdaterApp(ctk.CTk):
             ctk.CTkLabel(card, text="Lokale Dateipatterns (Komma-getrennt)").grid(row=9, column=0, sticky="w", padx=8, pady=(0, 8))
             ctk.CTkEntry(card, textvariable=patterns_var).grid(row=9, column=1, sticky="ew", padx=8, pady=(0, 8))
 
-            provider_vars[software.key] = {
+            keycode_var: ctk.StringVar | None = None
+            if software.key == "opentext_core_endpoint":
+                keycode_var = ctk.StringVar(value=str(internal.get("endpoint_keycode", "") or ""))
+                ctk.CTkLabel(
+                    card,
+                    text="Endpoint Site-Keycode (XXXX-XXXX-… aus Console; stilles Setup per Dateiname)",
+                    anchor="w",
+                ).grid(row=10, column=0, sticky="w", padx=8, pady=(4, 8))
+                ctk.CTkEntry(card, textvariable=keycode_var).grid(row=10, column=1, sticky="ew", padx=8, pady=(4, 8))
+
+            pv: dict[str, object] = {
                 "enabled": enabled_var,
                 "display_name": display_var,
                 "choco_package": choco_var,
@@ -1661,6 +1677,9 @@ class UpdaterApp(ctk.CTk):
                 "search_terms": terms_var,
                 "local_patterns": patterns_var,
             }
+            if keycode_var is not None:
+                pv["endpoint_keycode"] = keycode_var
+            provider_vars[software.key] = pv
             row += 1
 
         def save_settings() -> None:
@@ -1676,17 +1695,20 @@ class UpdaterApp(ctk.CTk):
                     enabled_keys.append(key)
                 terms = [t.strip() for t in str(vals["search_terms"].get()).split(",") if t.strip()]  # type: ignore[index]
                 local_patterns = [t.strip() for t in str(vals["local_patterns"].get()).split(",") if t.strip()]  # type: ignore[index]
+                ii: dict[str, str] = {
+                    "path": str(vals["path"].get()).strip(),  # type: ignore[index]
+                    "type": str(vals["installer_type"].get()).strip().lower() or "auto",  # type: ignore[index]
+                    "response_file": str(vals["response_file"].get()).strip(),  # type: ignore[index]
+                    "silent_args": str(vals["silent_args"].get()).strip(),  # type: ignore[index]
+                }
+                if "endpoint_keycode" in vals:
+                    ii["endpoint_keycode"] = str(vals["endpoint_keycode"].get()).strip()  # type: ignore[index]
                 providers_out[key] = {
                     "enabled": enabled,
                     "display_name": str(vals["display_name"].get()).strip(),  # type: ignore[index]
                     "choco_package": str(vals["choco_package"].get()).strip(),  # type: ignore[index]
                     "winget_id": str(vals["winget_id"].get()).strip(),  # type: ignore[index]
-                    "internal_installer": {
-                        "path": str(vals["path"].get()).strip(),  # type: ignore[index]
-                        "type": str(vals["installer_type"].get()).strip().lower() or "auto",  # type: ignore[index]
-                        "response_file": str(vals["response_file"].get()).strip(),  # type: ignore[index]
-                        "silent_args": str(vals["silent_args"].get()).strip(),  # type: ignore[index]
-                    },
+                    "internal_installer": ii,
                     "search_terms": terms,
                     "local_patterns": local_patterns,
                 }
@@ -1705,6 +1727,15 @@ class UpdaterApp(ctk.CTk):
                         "response_file": str(vals["response_file"].get()).strip(),
                         "silent_args": str(vals["silent_args"].get()).strip(),
                         "display_name": "OpenText",
+                    }  # type: ignore[index]
+                if key == "opentext_core_endpoint":
+                    internal_installers["opentext_endpoint"] = {
+                        "path": str(vals["path"].get()).strip(),
+                        "type": str(vals["installer_type"].get()).strip().lower() or "auto",
+                        "response_file": str(vals["response_file"].get()).strip(),
+                        "silent_args": str(vals["silent_args"].get()).strip(),
+                        "display_name": "OpenText Core Endpoint Protection",
+                        "endpoint_keycode": str(vals["endpoint_keycode"].get()).strip() if "endpoint_keycode" in vals else "",
                     }  # type: ignore[index]
             new_config["software_providers"] = providers_out
             new_config["enabled_standard_software"] = enabled_keys

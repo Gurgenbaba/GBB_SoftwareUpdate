@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import time
@@ -287,13 +289,13 @@ class InstallerService:
 
         package_name = self._resolve_choco_package_name(software)
         winget_id = self._resolve_winget_id(software)
-        dynamic_choco = None if (package_name or software.key == "opentext") else self._find_dynamic_package(software)
+        dynamic_choco = None if (package_name or software.key in ("opentext", "opentext_core_endpoint")) else self._find_dynamic_package(software)
         if dynamic_choco:
             self.logger.info("Chocolatey dynamischer Treffer: %s", dynamic_choco)
             package_name = dynamic_choco
             if resolution_callback is not None:
                 resolution_callback(software.key, dynamic_choco, None)
-        dynamic_winget = None if (winget_id or software.key == "opentext") else self._find_dynamic_winget_id(software)
+        dynamic_winget = None if (winget_id or software.key in ("opentext", "opentext_core_endpoint")) else self._find_dynamic_winget_id(software)
         if dynamic_winget:
             self.logger.info("WinGet dynamischer Treffer: %s", dynamic_winget)
             winget_id = dynamic_winget
@@ -727,6 +729,45 @@ class InstallerService:
         self.logger.info("Alternative WinGet-ID gewaehlt fuer %s: %s", software.display_name, best_id)
         return best_id
 
+    def _finalize_opentext_endpoint_exe(
+        self,
+        source_text: str,
+        cmd_source: str,
+        downloaded_file: str | None,
+        is_url_source: bool,
+        keycode: str,
+    ) -> tuple[str, str | None, str]:
+        """Keycode-EXE laut Hersteller; Rueckgabe (cmd_source, downloaded_file_fuer_cleanup, fehler_text)."""
+        if is_url_source:
+            exe_name = self._endpoint_keycode_exe_basename(keycode)
+            if not exe_name or not downloaded_file or not os.path.isfile(downloaded_file):
+                return ("", None, "endpoint_keycode fehlt oder ungueltig (Format XXXX-XXXX-XXXX-XXXX-XXXX).")
+            dest = Path(downloaded_file).resolve().parent / exe_name
+            if dest.resolve() != Path(downloaded_file).resolve():
+                if dest.exists():
+                    dest.unlink(missing_ok=True)
+                shutil.move(downloaded_file, str(dest))
+            self.logger.info("OpenText Core Endpoint: Agent als %s bereitgestellt (laut Keycode-Dateiname).", exe_name)
+            return (str(dest), str(dest), "")
+        src = Path(cmd_source)
+        if not src.is_file():
+            return ("", downloaded_file, f"Installer nicht gefunden: {cmd_source}")
+        if self._is_endpoint_keycode_exe_filename(src.name):
+            return (str(src.resolve()), None, "")
+        exe_name = self._endpoint_keycode_exe_basename(keycode)
+        if not exe_name:
+            return (
+                "",
+                downloaded_file,
+                "Lokaler Installer nicht im Keycode-Format: Datei umbenennen oder endpoint_keycode setzen.",
+            )
+        dest = Path(tempfile.gettempdir()) / exe_name
+        if dest.exists():
+            dest.unlink(missing_ok=True)
+        shutil.copy2(src, str(dest))
+        self.logger.info("OpenText Core Endpoint: Kopie nach %s fuer Hintergrund-Installation.", dest)
+        return (str(dest), str(dest), "")
+
     def _run_internal_installer(
         self,
         software: SoftwarePackage,
@@ -742,6 +783,11 @@ class InstallerService:
             return None
         source_text = str(source).strip()
         is_url_source = self._is_url_source(source_text)
+        use_endpoint = software.internal_installer_key == "opentext_endpoint"
+        qc_detail = (
+            "OpenText Core Endpoint: endpoint_keycode in Einstellungen setzen "
+            "(Site-Key XXXX-XXXX-XXXX-XXXX-XXXX aus Management Console, Download Windows .exe)."
+        )
         if not is_url_source:
             installer_path = Path(source_text)
             if not installer_path.exists():
@@ -767,6 +813,70 @@ class InstallerService:
                 self.logger.error("Download fehlgeschlagen fuer %s: %s", software.display_name, exc)
                 return SoftwareState("Quelle erforderlich", detail=source_text, installed_version="—", available_version="—", provider="Quelle erforderlich")
 
+        if use_endpoint and dry_run:
+            if is_url_source:
+                if not self._endpoint_keycode_exe_basename(internal_info.endpoint_keycode):
+                    return SoftwareState(
+                        "Quelle erforderlich",
+                        detail=qc_detail,
+                        installed_version="—",
+                        available_version="—",
+                        provider="Quelle erforderlich",
+                    )
+                bn = self._endpoint_keycode_exe_basename(internal_info.endpoint_keycode)
+                return SoftwareState(
+                    "Dry-Run (unveraendert)",
+                    detail=f"[DRY-RUN] Download {source_text}, Ausfuehrung als {bn} (Hintergrund-Installation)",
+                    installed_version="—",
+                    available_version="—",
+                    provider="Intern",
+                )
+            lp = Path(cmd_source)
+            if lp.is_file() and self._is_endpoint_keycode_exe_filename(lp.name):
+                return SoftwareState(
+                    "Dry-Run (unveraendert)",
+                    detail=f"[DRY-RUN] Start {cmd_source}",
+                    installed_version="—",
+                    available_version="—",
+                    provider="Intern",
+                )
+            if not self._endpoint_keycode_exe_basename(internal_info.endpoint_keycode):
+                return SoftwareState(
+                    "Quelle erforderlich",
+                    detail=qc_detail + " Alternativ: Installer lokal als Keycode-EXE ablegen.",
+                    installed_version="—",
+                    available_version="—",
+                    provider="Quelle erforderlich",
+                )
+            bn = self._endpoint_keycode_exe_basename(internal_info.endpoint_keycode)
+            return SoftwareState(
+                "Dry-Run (unveraendert)",
+                detail=f"[DRY-RUN] Kopie nach %TEMP%\\{bn} und Start (Hintergrund-Installation)",
+                installed_version="—",
+                available_version="—",
+                provider="Intern",
+            )
+
+        if use_endpoint and not dry_run:
+            new_src, new_dl, err = self._finalize_opentext_endpoint_exe(
+                source_text, cmd_source, downloaded_file, is_url_source, internal_info.endpoint_keycode
+            )
+            if err:
+                if downloaded_file and os.path.isfile(downloaded_file):
+                    try:
+                        Path(downloaded_file).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                return SoftwareState(
+                    "Quelle erforderlich",
+                    detail=err,
+                    installed_version="—",
+                    available_version="—",
+                    provider="Quelle erforderlich",
+                )
+            cmd_source = new_src
+            downloaded_file = new_dl
+
         is_msi = self._is_msi_installer(cmd_source, installer_type)
         if software.key == "avaya_workplace" and is_msi:
             self.logger.info("Avaya MSI Installer erkannt.")
@@ -775,16 +885,20 @@ class InstallerService:
             self.logger.info("OpenText MSI Installer erkannt.")
         if software.key == "opentext" and not is_msi:
             self.logger.info("OpenText EXE Installer erkannt.")
+        if use_endpoint and not is_msi:
+            self.logger.info("OpenText Core Endpoint EXE (Keycode-Name) wird gestartet.")
         cmd = self._build_internal_install_command(cmd_source, silent_args, is_msi)
         if software.key == "opentext" and not is_msi and not silent_args.strip():
             cmd = [cmd_source, "/qn"]
+        if use_endpoint and not is_msi and not silent_args.strip():
+            cmd = [cmd_source]
         if dry_run:
             self.logger.info("[DRY-RUN] Wuerde internen Installer starten: %s", " ".join(cmd))
             if software.key == "opentext" and response_file:
                 self.logger.info("[DRY-RUN] Optionaler Configure-Schritt: EConfig.ps1 -rfile %s", response_file)
             return SoftwareState("Dry-Run (unveraendert)", detail=" ".join(cmd), installed_version="—", available_version="—", provider="Intern")
 
-        if software.key in {"avaya_workplace", "opentext"}:
+        if software.key in {"avaya_workplace", "opentext", "opentext_core_endpoint"}:
             self.logger.info("%s Installation gestartet...", software.display_name)
         self.logger.info("%s aus Firmenquelle installiert: %s", software.display_name, source_text)
         self.logger.info("EXEC: %s", " ".join(cmd))
@@ -1027,11 +1141,35 @@ class InstallerService:
         return [cmd_source, *extra_args] if extra_args else [cmd_source]
 
     class _InternalInstallerInfo:
-        def __init__(self, source: str | None, silent_args: str, installer_type: str, response_file: str) -> None:
+        def __init__(
+            self,
+            source: str | None,
+            silent_args: str,
+            installer_type: str,
+            response_file: str,
+            endpoint_keycode: str = "",
+        ) -> None:
             self.source = source
             self.silent_args = silent_args
             self.installer_type = installer_type
             self.response_file = response_file
+            self.endpoint_keycode = endpoint_keycode
+
+    @staticmethod
+    def _endpoint_keycode_exe_basename(keycode: str) -> str | None:
+        """Herstellerformat: XXXX-XXXX-XXXX-XXXX-XXXX.exe (Site-Key aus Console)."""
+        s = (keycode or "").strip()
+        if not s:
+            return None
+        if not s.lower().endswith(".exe"):
+            s = f"{s}.exe"
+        if re.match(r"^[A-Za-z0-9]{4}(?:-[A-Za-z0-9]{4}){4}\.exe$", s):
+            return s
+        return None
+
+    @staticmethod
+    def _is_endpoint_keycode_exe_filename(name: str) -> bool:
+        return bool(InstallerService._endpoint_keycode_exe_basename(name))
 
     def _resolve_internal_installer_info(
         self,
@@ -1042,13 +1180,21 @@ class InstallerService:
         silent_args = ""
         installer_type = "auto"
         response_file = ""
+        endpoint_keycode = ""
+        pc_raw = self.provider_configs.get(software.key, {})
+        pc = pc_raw if isinstance(pc_raw, dict) else {}
+        pc_int = pc.get("internal_installer", {})
+        pc_int = pc_int if isinstance(pc_int, dict) else {}
         if software.internal_installer_key and software.internal_installer_key in internal_installers:
             internal = internal_installers[software.internal_installer_key]
             source = internal.get("path", source)
             silent_args = str(internal.get("silent_args", "")).strip()
             installer_type = str(internal.get("type", "auto") or "auto").strip().lower()
             response_file = str(internal.get("response_file", "") or "").strip()
-        return InstallerService._InternalInstallerInfo(source, silent_args, installer_type, response_file)
+            endpoint_keycode = str(internal.get("endpoint_keycode", "") or "").strip()
+        if str(pc_int.get("endpoint_keycode", "") or "").strip():
+            endpoint_keycode = str(pc_int.get("endpoint_keycode", "") or "").strip()
+        return InstallerService._InternalInstallerInfo(source, silent_args, installer_type, response_file, endpoint_keycode)
 
     def _run_opentext_configure_step(self, installer_source: str, response_file: str) -> None:
         response_path = Path(response_file)

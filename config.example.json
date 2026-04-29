@@ -7,6 +7,7 @@
     "microsoft_teams",
     "office365business",
     "opentext",
+    "opentext_core_endpoint",
     "avaya_workplace",
     "filezilla",
     "firefox"
@@ -21,6 +22,14 @@
       "path": "\\\\fileserver\\software\\OpenText\\OpenTextSetup.exe",
       "silent_args": "/quiet /norestart",
       "display_name": "OpenText"
+    },
+    "opentext_endpoint": {
+      "path": "https://anywhere.webrootcloudav.com/zerol/wsasme.exe",
+      "silent_args": "",
+      "type": "exe",
+      "response_file": "",
+      "display_name": "OpenText Core Endpoint Protection",
+      "endpoint_keycode": ""
     }
   },
   "software_providers": {
@@ -89,6 +98,20 @@
         "silent_args": "/quiet /norestart"
       },
       "search_terms": ["opentext", "open text"]
+    },
+    "opentext_core_endpoint": {
+      "enabled": true,
+      "display_name": "OpenText Core Endpoint Protection",
+      "choco_package": "",
+      "winget_id": "",
+      "internal_installer": {
+        "path": "https://anywhere.webrootcloudav.com/zerol/wsasme.exe",
+        "silent_args": "",
+        "type": "exe",
+        "response_file": "",
+        "endpoint_keycode": ""
+      },
+      "search_terms": ["webroot", "secureanywhere", "opentext endpoint"]
     },
     "avaya_workplace": {
       "enabled": true,
