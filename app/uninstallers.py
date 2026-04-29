@@ -78,6 +78,8 @@ class UninstallerService:
         cleanup_messages: list[str] = []
         hard_failures: list[str] = []
         choco_failed = False
+        citrix_native_ok = False
+        citrix_native_attempted = False
         if prev.provider == "Chocolatey" and prev.package_name:
             if dry_run:
                 return ("DRY-RUN: wuerde entfernen", SoftwareState("Dry-Run (unveraendert)", package_name=prev.package_name, provider="Chocolatey"))
@@ -86,11 +88,13 @@ class UninstallerService:
             if choco_msg:
                 cleanup_messages.append(choco_msg)
             choco_failed = result.returncode != 0
-            if choco_failed and software.key == "citrix_workspace":
+            if choco_failed and software.key == "citrix_workspace" and not dry_run:
+                citrix_native_attempted = True
                 native_ok, native_msg = self._try_citrix_workspace_native_uninstall(dry_run)
                 if native_msg:
                     cleanup_messages.append(native_msg)
                 if native_ok:
+                    citrix_native_ok = True
                     choco_failed = False
             if choco_failed:
                 hard_failures.append(f"Chocolatey RC={result.returncode}")
@@ -111,6 +115,15 @@ class UninstallerService:
                 )
                 if not not_found_hint:
                     hard_failures.append(f"WinGet RC={result.returncode}")
+
+        if software.key == "citrix_workspace" and not dry_run and not citrix_native_ok and not citrix_native_attempted:
+            citrix_native_attempted = True
+            native_ok, native_msg = self._try_citrix_workspace_native_uninstall(dry_run)
+            if native_msg:
+                cleanup_messages.append(native_msg)
+            if native_ok:
+                citrix_native_ok = True
+                hard_failures = [h for h in hard_failures if not (h.startswith("Chocolatey RC=") or h.startswith("WinGet RC="))]
 
         # Restlose Entfernung: versuche gefundene Registry-Deinstallationsstrings auszufuehren.
         if dry_run:
@@ -194,6 +207,16 @@ class UninstallerService:
             return []
         exe = UninstallerService._exe_from_cmd(cmd)
         lower = [arg.lower() for arg in cmd]
+        joined_l = " ".join(cmd).lower()
+        # Microsoft Teams (per-user): Update.exe nutzt --uninstall -s; blindes /S erzeugt WinError 87.
+        if exe == "update.exe" and "teams" in joined_l:
+            out = list(cmd)
+            ls = [a.lower() for a in out]
+            if "--uninstall" not in joined_l:
+                out.append("--uninstall")
+            if "-s" not in ls and "/s" not in ls:
+                out.append("-s")
+            return out
         if exe == "msiexec.exe" or exe == "msiexec":
             out = [cmd[0]]
             for arg in cmd[1:]:
@@ -220,6 +243,8 @@ class UninstallerService:
                 for arg in out[1:]
             )
             if not has_target:
+                return []
+            if not re.search(r"\{[0-9A-Fa-f-]{36}\}", " ".join(out)):
                 return []
 
             if "/qn" not in out_lower:
@@ -276,29 +301,47 @@ class UninstallerService:
         return entries
 
     def _try_citrix_workspace_native_uninstall(self, dry_run: bool) -> tuple[bool, str]:
-        """Wenn Chocolatey-Skripte einen veralteten Pfad erwarten: TrolleyExpress o.ae. direkt starten."""
+        """Wenn Chocolatey/WinGet scheitern: TrolleyExpress/CitrixWorkspaceApp direkt starten."""
         if dry_run:
             return False, "[DRY-RUN] Citrix nativer Deinstaller (TrolleyExpress/CitrixWorkspaceApp)"
         roots = [
             Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Citrix",
             Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Citrix",
+            Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Citrix",
         ]
         candidates: list[Path] = []
         for root in roots:
             if not root.is_dir():
                 continue
             for sub in sorted(root.glob("Citrix Workspace*"), key=lambda p: str(p), reverse=True):
-                for rel in ("TrolleyExpress.exe", "CitrixWorkspaceApp.exe"):
+                for rel in ("TrolleyExpress.exe", "CitrixWorkspaceApp.exe", "bootstrapperhelper.exe"):
                     p = sub / rel
                     if p.is_file():
                         candidates.append(p)
                 try:
-                    for p in sub.rglob("TrolleyExpress.exe"):
-                        if p.is_file() and p not in candidates:
-                            candidates.append(p)
+                    for name in ("TrolleyExpress.exe", "CitrixWorkspaceApp.exe", "bootstrapperhelper.exe"):
+                        for p in sub.rglob(name):
+                            if p.is_file() and p not in candidates:
+                                candidates.append(p)
                 except OSError:
                     pass
-        for exe_path in candidates[:4]:
+            try:
+                for p in root.rglob("TrolleyExpress.exe"):
+                    if p.is_file() and p not in candidates:
+                        candidates.append(p)
+            except OSError:
+                pass
+        seen: set[str] = set()
+        uniq: list[Path] = []
+        for p in candidates:
+            try:
+                key = str(p.resolve())
+            except OSError:
+                key = str(p)
+            if key not in seen:
+                seen.add(key)
+                uniq.append(p)
+        for exe_path in uniq[:8]:
             try:
                 cp = subprocess.run(
                     [str(exe_path), "/silent", "/uninstall"],
@@ -317,7 +360,10 @@ class UninstallerService:
                 return False, msg
             except Exception as exc:  # pylint: disable=broad-except
                 return False, f"Citrix nativ {exe_path.name}: {exc}"
-        return False, ""
+        return (
+            False,
+            "Citrix nativ: Kein TrolleyExpress/CitrixWorkspaceApp unter Citrix- oder ProgramData-Pfaden gefunden.",
+        )
 
     @staticmethod
     def _append_access_denied_hint(messages: list[str]) -> None:
@@ -467,8 +513,7 @@ class UninstallerService:
                 r"{PROGRAMFILES}\WindowsApps\Microsoft.Teams*",
             ],
             "office365business": [
-                r"{PROGRAMFILES}\Microsoft Office",
-                r"{PROGRAMFILESX86}\Microsoft Office",
+                # Kein shutil unter Program Files\Microsoft Office: schuetzt installierte Office-Instanz / WinError 5.
                 r"{PROGRAMDATA}\Microsoft\Office",
                 r"{LOCALAPPDATA}\Microsoft\Office",
                 r"{APPDATA}\Microsoft\Office",
