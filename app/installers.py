@@ -4,7 +4,6 @@ import os
 import shlex
 import subprocess
 import tempfile
-import threading
 import time
 import urllib.parse
 import urllib.request
@@ -61,22 +60,10 @@ class InstallerService:
         if self._activity_callback:
             self._activity_callback(software.display_name, message)
 
-    def _prefetch_internal_url_candidate(
-        self, software: SoftwarePackage, internal_installers: dict[str, dict[str, Any]]
-    ) -> str | None:
-        if software.primary_package or software.winget_id:
-            return None
-        info = self._resolve_internal_installer_info(software, internal_installers)
-        src = str(info.source or "").strip()
-        if self._is_url_source(src):
-            return src
-        return None
-
     @staticmethod
     def _hide_for_internal_subprocess(is_msi: bool, native_ui: bool) -> bool:
-        if is_msi:
-            return True
-        return not native_ui
+        _ = (is_msi, native_ui)
+        return True
 
     @staticmethod
     def _subprocess_hidden_kwargs() -> dict[str, Any]:
@@ -129,35 +116,24 @@ class InstallerService:
         report_rows: list[ReportEntry] = []
         self._download_progress = download_progress_callback
         self._activity_callback = activity_callback
-        prefetch_paths: dict[str, str] = {}
-        prefetch_exc: dict[str, BaseException] = {}
-        prefetch_box: dict[str, threading.Thread | None] = {"thread": None}
-
-        def wait_prefetch() -> None:
-            t = prefetch_box["thread"]
-            if t is not None:
-                t.join(timeout=7200)
-                prefetch_box["thread"] = None
 
         try:
             for index, key in enumerate(selected_keys, start=1):
-                wait_prefetch()
                 software = self.software_by_key[key]
                 self._current_software_key = key
                 self._native_vendor_install_ui = key in NATIVE_VENDOR_INSTALL_UI_KEYS
-
-                exc_pref = prefetch_exc.pop(key, None)
-                path_opt = prefetch_paths.pop(key, None)
-                self._prefetched_internal_path = None if exc_pref else path_opt
-                if exc_pref:
-                    self.logger.warning("Hintergrund-Download fuer %s fehlgeschlagen: %s", key, exc_pref)
+                self._prefetched_internal_path = None
 
                 progress_callback(index - 1, total)
                 if item_start_callback is not None:
                     item_start_callback(key)
-                self._emit_activity(software, "Installation …")
                 self.logger.info("%s wird verarbeitet...", software.display_name)
                 previous_state = current_states.get(key, SoftwareState("Nicht geprueft"))
+                st0 = previous_state.status
+                if st0 == "Update verfuegbar":
+                    self._emit_activity(software, "Update …")
+                elif st0 not in ("Aktuell", "Installiert", "Dry-Run (unveraendert)"):
+                    self._emit_activity(software, "Installation …")
 
                 try:
                     action, new_state = self._process_single(software, previous_state, dry_run, installers, resolution_callback)
@@ -173,9 +149,6 @@ class InstallerService:
                     )
                 finally:
                     self._prefetched_internal_path = None
-
-                if path_opt and os.path.isfile(path_opt):
-                    Path(path_opt).unlink(missing_ok=True)
 
                 current_states[key] = new_state
                 status_callback(key, new_state)
@@ -202,29 +175,8 @@ class InstallerService:
                     )
                 )
 
-                if index < len(selected_keys):
-                    next_key = selected_keys[index]
-                    next_sw = self.software_by_key[next_key]
-                    next_url = self._prefetch_internal_url_candidate(next_sw, installers)
-                    if next_url:
-
-                        def bg_pref(k: str = next_key, u: str = next_url) -> None:
-                            try:
-                                pth = self._download_installer_from_url(u, report_progress=False)
-                                prefetch_paths[k] = pth
-                            except BaseException as exc:  # noqa: BLE001
-                                prefetch_exc[k] = exc
-
-                        prefetch_box["thread"] = threading.Thread(target=bg_pref, daemon=True)
-                        prefetch_box["thread"].start()
-
             return report_rows
         finally:
-            wait_prefetch()
-            for orphan in list(prefetch_paths.values()):
-                Path(orphan).unlink(missing_ok=True)
-            prefetch_paths.clear()
-            prefetch_exc.clear()
             self._download_progress = None
             self._activity_callback = None
             self._prefetched_internal_path = None
@@ -452,7 +404,7 @@ class InstallerService:
                 errors.append(f"Lokal/USB: {state.detail}")
         if package_name:
             self.logger.info("Nutze Provider: Chocolatey")
-            action, state = self._run_choco_install(package_name, prev, dry_run)
+            action, state = self._run_choco_upgrade(package_name, prev, dry_run)
             if dry_run or state.status != "Fehler":
                 return action, state
             if software.key == "teamviewer" and self._is_hash_mismatch(state.detail):
@@ -563,7 +515,7 @@ class InstallerService:
                 return ("Quelle erforderlich", installer_state)
         if package_name:
             self.logger.info("Nutze Provider: Chocolatey")
-            action, state = self._run_choco_install(package_name, prev, dry_run)
+            action, state = self._run_choco_upgrade(package_name, prev, dry_run)
             if dry_run or state.status != "Fehler":
                 return action, state
             errors.append(f"Chocolatey: {state.detail}")
@@ -673,7 +625,7 @@ class InstallerService:
             errors.append(f"WinGet: {state.detail}")
         if package_name:
             self.logger.info("Nutze Provider: Chocolatey")
-            action, state = self._run_choco_install(package_name, prev, dry_run)
+            action, state = self._run_choco_upgrade(package_name, prev, dry_run)
             if dry_run or state.status != "Fehler":
                 return action, state
             errors.append(f"Chocolatey: {state.detail}")
@@ -711,16 +663,6 @@ class InstallerService:
         interactive = bool(getattr(self, "_native_vendor_install_ui", False))
         result = self._run_winget_with_lock_retry("upgrade", winget_id, interactive=interactive)
         return ("Upgrade", SoftwareState("Aktuell" if result.ok else "Fehler", package_name=winget_id, detail=self._combine_error(result), provider="WinGet"))
-
-    def _run_choco_install(self, package_name: str, prev: SoftwareState, dry_run: bool) -> tuple[str, SoftwareState]:
-        if dry_run:
-            return ("DRY-RUN: wuerde installieren", SoftwareState("Dry-Run (unveraendert)", package_name=package_name, provider="Chocolatey"))
-        sw = self.software_by_key.get(self._current_software_key)
-        if sw:
-            self._emit_activity(sw, "Chocolatey …")
-        native = bool(getattr(self, "_native_vendor_install_ui", False))
-        result = self._run_with_retry(package_name, "install", package_name, native_ui=native)
-        return ("Install", SoftwareState("Installiert" if result.ok else "Fehler", package_name=package_name, detail=self._combine_error(result), provider="Chocolatey"))
 
     def _run_winget_install(self, winget_id: str, prev: SoftwareState, dry_run: bool) -> tuple[str, SoftwareState]:
         if dry_run:
@@ -929,13 +871,8 @@ class InstallerService:
             if not args:
                 self.logger.warning("Keine Silent-Args konfiguriert, Installation kann interaktiv werden.")
             cmd = [str(local_installer), *args] if args else [str(local_installer)]
-        native = bool(getattr(self, "_native_vendor_install_ui", False))
-        if installer_type in {"msi", "ps1"}:
-            hide_w = True
-        else:
-            hide_w = not native
         try:
-            completed = self._run_subprocess_with_lock_retry(cmd, hide_window=hide_w)
+            completed = self._run_subprocess_with_lock_retry(cmd, hide_window=True)
         except subprocess.TimeoutExpired:
             return (
                 "Lokal/USB",

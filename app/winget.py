@@ -217,7 +217,8 @@ class WingetService:
                 "--accept-package-agreements",
                 "--accept-source-agreements",
             ]
-        return self._run(args, timeout=INSTALL_TIMEOUT_SECONDS, hide_console=not interactive)
+        # winget.exe immer ohne leeres Hilfs-Konsolenfenster; --interactive gilt fuer das Paket-Setup.
+        return self._run(args, timeout=INSTALL_TIMEOUT_SECONDS, hide_console=True)
 
     def upgrade(self, package_id: str, *, interactive: bool = False) -> CommandResult:
         if interactive:
@@ -240,7 +241,7 @@ class WingetService:
                 "--accept-package-agreements",
                 "--accept-source-agreements",
             ]
-        return self._run(args, timeout=INSTALL_TIMEOUT_SECONDS, hide_console=not interactive)
+        return self._run(args, timeout=INSTALL_TIMEOUT_SECONDS, hide_console=True)
 
     def uninstall(self, package_id: str) -> CommandResult:
         return self._run(

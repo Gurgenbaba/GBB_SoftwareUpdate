@@ -60,7 +60,7 @@ SOFTWARE_ALIASES: dict[str, tuple[str, ...]] = {
     "citrix_workspace": ("citrix", "workspace", "citrix receiver", "citrixworkspace"),
     "adobe_reader": ("adobe", "acrobat", "reader", "acrobat reader"),
     "teamviewer": ("teamviewer", "team viewer"),
-    "microsoft_teams": ("microsoft teams", "teams", "ms teams"),
+    "microsoft_teams": ("microsoft teams", "ms teams", "teams machine-wide", "teams work or school"),
     "office365business": ("microsoft 365", "office", "office365", "m365", "o365"),
     "opentext": ("opentext", "open text", "opentext content"),
     "avaya_workplace": ("avaya", "avaya workplace", "workplace"),

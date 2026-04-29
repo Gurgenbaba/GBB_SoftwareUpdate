@@ -91,6 +91,7 @@ class UpdaterApp(ctk.CTk):
         self.provider_labels: dict[str, ctk.CTkLabel] = {}
         self.row_progress_bars: dict[str, ctk.CTkProgressBar] = {}
         self.current_states: dict[str, SoftwareState] = {}
+        self._operation_lock = threading.Lock()
         self.row_visible: dict[str, bool] = {}
         self.last_report_file: Path | None = None
         self.history_scroll: ctk.CTkScrollableFrame | None = None
@@ -2105,9 +2106,13 @@ class UpdaterApp(ctk.CTk):
         self._run_action("remove")
 
     def _run_action(self, mode: str) -> None:
+        if not self._operation_lock.acquire(blocking=False):
+            messagebox.showwarning(APP_NAME, "Ein Vorgang läuft bereits. Bitte warten.", parent=self)
+            return
         mandatory = mode == "install" and self.mandatory_install_var.get()
         keys = [s.key for s in self.runtime.visible_catalog] if mandatory else self._selected_keys()
         if not keys:
+            self._operation_lock.release()
             messagebox.showwarning(APP_NAME, "Bitte mindestens ein Programm auswählen.")
             return
 
@@ -2120,8 +2125,9 @@ class UpdaterApp(ctk.CTk):
         elif not self.dry_run_var.get() and not messagebox.askyesno(
             APP_NAME,
             "Produktivmodus: Es werden Änderungen am System vorgenommen. Fortfahren?",
-        ):
-            return
+            ):
+                self._operation_lock.release()
+                return
 
         self._set_actions_enabled(False)
         self._progress_phase = "bearbeitet"
@@ -2153,91 +2159,103 @@ class UpdaterApp(ctk.CTk):
         dry = self.dry_run_var.get()
 
         def worker() -> None:
-            if mode == "install" and "filezilla" in keys:
-                if self._filezilla_buchhaltung is True:
-                    self.logger.info("FileZilla: Installation im Buchhaltungskontext (per Alle Pakete: Ja).")
-                else:
-                    self.logger.info("FileZilla: Installation ohne Buchhaltungs-Markierung (manuell oder anderer Auswahlweg).")
-            if mode == "install" and InstallerService.is_reboot_pending():
-                self.logger.warning("Reboot Pending erkannt: Neustart empfohlen/erforderlich.")
-                self.ui_queue.put(("hint", "Neustart empfohlen/erforderlich"))
-                if mandatory:
-                    self.ui_queue.put(("warning", "Neustart empfohlen/erforderlich. Pflichtlauf wird trotzdem fortgesetzt."))
-            if mode == "install" and mandatory:
-                missing_sources = self.installer.precheck_sources(keys, self.runtime.internal_installers)
-                if missing_sources:
-                    self.logger.warning("Mandatory Source-Check: %s Quelle(n) fehlen.", len(missing_sources))
-                    self.ui_queue.put(
-                        (
-                            "warning",
-                            f"Mandatory Source-Check: {len(missing_sources)} Quelle(n) fehlen. Diese Eintraege werden als 'Quelle erforderlich' markiert, falls keine Providerquelle verfuegbar ist.",
-                        )
-                    )
-                all_states = self.scanner.scan()
-                for key in keys:
-                    st = all_states.get(key, SoftwareState("Nicht geprueft"))
-                    self.current_states[key] = st
-                    self.ui_queue.put(("software_row", (key, st)))
-            rows = self.installer.process(
-                keys,
-                self.current_states,
-                status_callback,
-                progress_callback,
-                item_start_callback=item_start_callback,
-                resolution_callback=resolution_callback,
-                dry_run=dry,
-                internal_installers=self.runtime.internal_installers,
-                download_progress_callback=download_progress_callback,
-                activity_callback=activity_callback,
-            ) if mode == "install" else self.uninstaller.process(
-                keys,
-                self.current_states,
-                status_callback,
-                progress_callback,
-                item_start_callback=item_start_callback,
-                dry_run=dry,
-            )
-            self.last_report_file = self.report_writer.write_report(rows, "install_report")
-            if mode == "install":
-                pending_after = any((r.reboot_required or "no").lower() == "yes" for r in rows)
-                if pending_after:
+            try:
+                if mode == "install" and "filezilla" in keys:
+                    if self._filezilla_buchhaltung is True:
+                        self.logger.info("FileZilla: Installation im Buchhaltungskontext (per Alle Pakete: Ja).")
+                    else:
+                        self.logger.info("FileZilla: Installation ohne Buchhaltungs-Markierung (manuell oder anderer Auswahlweg).")
+                if mode == "install" and InstallerService.is_reboot_pending():
+                    self.logger.warning("Reboot Pending erkannt: Neustart empfohlen/erforderlich.")
                     self.ui_queue.put(("hint", "Neustart empfohlen/erforderlich"))
-            self.logger.info("Vorgang abgeschlossen.")
-            self._queue_status("OK - Vorgang abgeschlossen.")
-            summary = self._install_summary_message(rows, dry, mandatory=mandatory)
-            outro = (
-                "Bitte unnötige Installationsdateien oder Downloads löschen und installierte Programme kurz testen."
-                if mode == "install"
-                else "Bitte entfernte Programme stichprobenartig prüfen."
-            )
-            full_summary = (
-                "OK - Vorgang abgeschlossen.\n\n"
-                f"{summary}\n\n"
-                f"{outro}"
-            )
-            self.ui_queue.put(
-                (
-                    "summary_dialog",
-                    {
-                        "title": (
-                            "Abschluss — Installation (Dry-Run)"
-                            if dry and mode == "install"
-                            else "Abschluss — Entfernen (Dry-Run)"
-                            if dry and mode == "remove"
-                            else "Abschluss — Installation"
-                            if mode == "install"
-                            else "Abschluss — Entfernen"
-                        ),
-                        "summary": full_summary,
-                        "entries": rows,
-                        "report_csv": self.last_report_file,
-                        "dry_run": dry,
-                        "kind": "install",
-                    },
+                    if mandatory:
+                        self.ui_queue.put(("warning", "Neustart empfohlen/erforderlich. Pflichtlauf wird trotzdem fortgesetzt."))
+                if mode in ("install", "remove"):
+                    self._queue_status("Installationsstatus wird aktualisiert...")
+                    fresh = self.scanner.scan()
+                    self.current_states.update(fresh)
+                    for key in keys:
+                        if key in fresh:
+                            self.ui_queue.put(("software_row", (key, fresh[key])))
+                if mode == "install" and mandatory:
+                    missing_sources = self.installer.precheck_sources(keys, self.runtime.internal_installers)
+                    if missing_sources:
+                        self.logger.warning("Mandatory Source-Check: %s Quelle(n) fehlen.", len(missing_sources))
+                        self.ui_queue.put(
+                            (
+                                "warning",
+                                f"Mandatory Source-Check: {len(missing_sources)} Quelle(n) fehlen. Diese Eintraege werden als 'Quelle erforderlich' markiert, falls keine Providerquelle verfuegbar ist.",
+                            )
+                        )
+                rows = (
+                    self.installer.process(
+                        keys,
+                        self.current_states,
+                        status_callback,
+                        progress_callback,
+                        item_start_callback=item_start_callback,
+                        resolution_callback=resolution_callback,
+                        dry_run=dry,
+                        internal_installers=self.runtime.internal_installers,
+                        download_progress_callback=download_progress_callback,
+                        activity_callback=activity_callback,
+                    )
+                    if mode == "install"
+                    else self.uninstaller.process(
+                        keys,
+                        self.current_states,
+                        status_callback,
+                        progress_callback,
+                        item_start_callback=item_start_callback,
+                        dry_run=dry,
+                    )
                 )
-            )
-            self.ui_queue.put(("enable_actions", True))
-            self.ui_queue.put(("refresh_history", None))
+                self.last_report_file = self.report_writer.write_report(rows, "install_report")
+                if mode == "install":
+                    pending_after = any((r.reboot_required or "no").lower() == "yes" for r in rows)
+                    if pending_after:
+                        self.ui_queue.put(("hint", "Neustart empfohlen/erforderlich"))
+                self.logger.info("Vorgang abgeschlossen.")
+                self._queue_status("OK - Vorgang abgeschlossen.")
+                summary = self._install_summary_message(rows, dry, mandatory=mandatory)
+                outro = (
+                    "Bitte unnötige Installationsdateien oder Downloads löschen und installierte Programme kurz testen."
+                    if mode == "install"
+                    else "Bitte entfernte Programme stichprobenartig prüfen."
+                )
+                full_summary = (
+                    "OK - Vorgang abgeschlossen.\n\n"
+                    f"{summary}\n\n"
+                    f"{outro}"
+                )
+                self.ui_queue.put(
+                    (
+                        "summary_dialog",
+                        {
+                            "title": (
+                                "Abschluss — Installation (Dry-Run)"
+                                if dry and mode == "install"
+                                else "Abschluss — Entfernen (Dry-Run)"
+                                if dry and mode == "remove"
+                                else "Abschluss — Installation"
+                                if mode == "install"
+                                else "Abschluss — Entfernen"
+                            ),
+                            "summary": full_summary,
+                            "entries": rows,
+                            "report_csv": self.last_report_file,
+                            "dry_run": dry,
+                            "kind": "install",
+                        },
+                    )
+                )
+                self.ui_queue.put(("refresh_history", None))
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.exception("Fehler im Vorgang (%s): %s", mode, exc)
+                self._queue_status("Fehler im Vorgang.")
+            finally:
+                self._operation_lock.release()
+                self.ui_queue.put(("enable_actions", True))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2410,19 +2428,24 @@ class UpdaterApp(ctk.CTk):
         self.log_queue.put(line)
 
     def _poll_queues(self) -> None:
-        while True:
+        log_burst = 0
+        while log_burst < 400:
             try:
                 line = self.log_queue.get_nowait()
             except queue.Empty:
                 break
             self.log_box.insert("end", line + "\n")
             self.log_box.see("end")
+            log_burst += 1
 
-        while True:
+        ui_burst = 0
+        max_ui_burst = 32
+        while ui_burst < max_ui_burst:
             try:
                 action, payload = self.ui_queue.get_nowait()
             except queue.Empty:
                 break
+            ui_burst += 1
 
             if action == "status_line":
                 self._last_status_message = str(payload)
@@ -2592,4 +2615,8 @@ class UpdaterApp(ctk.CTk):
                 if tab_name:
                     self._set_system_tab_status(tab_name, "bereit" if ok else "fehler")
 
-        self.after(100, self._poll_queues)
+        if ui_burst >= max_ui_burst:
+            self.update_idletasks()
+            self.after(1, self._poll_queues)
+        else:
+            self.after(40, self._poll_queues)

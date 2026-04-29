@@ -27,7 +27,7 @@ class UninstallerService:
             return False
         if re.search(rf"(?<![a-z0-9]){re.escape(clean_term)}(?![a-z0-9])", clean_name):
             return True
-        return clean_term in clean_name
+        return False
 
     def __init__(self, choco_client, winget_client, logger, software_by_key: dict[str, SoftwarePackage] | None = None) -> None:
         self.choco = choco_client
@@ -77,6 +77,7 @@ class UninstallerService:
 
         cleanup_messages: list[str] = []
         hard_failures: list[str] = []
+        choco_failed = False
         if prev.provider == "Chocolatey" and prev.package_name:
             if dry_run:
                 return ("DRY-RUN: wuerde entfernen", SoftwareState("Dry-Run (unveraendert)", package_name=prev.package_name, provider="Chocolatey"))
@@ -84,7 +85,14 @@ class UninstallerService:
             choco_msg = (result.stderr or result.stdout or "").strip()
             if choco_msg:
                 cleanup_messages.append(choco_msg)
-            if result.returncode != 0:
+            choco_failed = result.returncode != 0
+            if choco_failed and software.key == "citrix_workspace":
+                native_ok, native_msg = self._try_citrix_workspace_native_uninstall(dry_run)
+                if native_msg:
+                    cleanup_messages.append(native_msg)
+                if native_ok:
+                    choco_failed = False
+            if choco_failed:
                 hard_failures.append(f"Chocolatey RC={result.returncode}")
 
         if software.winget_id and self.winget.is_available():
@@ -132,6 +140,8 @@ class UninstallerService:
             cleanup_messages.append(f"Deep-Cleanup entfernt: {deep_removed} Rest(e)")
         if deep_detail:
             cleanup_messages.append(deep_detail)
+
+        self._append_access_denied_hint(cleanup_messages)
 
         # Verifiziere nach Cleanup, ob noch ein valider uninstallbarer Treffer vorhanden ist.
         if self._registry_has_actionable_match(software, prev):
@@ -265,12 +275,70 @@ class UninstallerService:
                     continue
         return entries
 
+    def _try_citrix_workspace_native_uninstall(self, dry_run: bool) -> tuple[bool, str]:
+        """Wenn Chocolatey-Skripte einen veralteten Pfad erwarten: TrolleyExpress o.ae. direkt starten."""
+        if dry_run:
+            return False, "[DRY-RUN] Citrix nativer Deinstaller (TrolleyExpress/CitrixWorkspaceApp)"
+        roots = [
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Citrix",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Citrix",
+        ]
+        candidates: list[Path] = []
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for sub in sorted(root.glob("Citrix Workspace*"), key=lambda p: str(p), reverse=True):
+                for rel in ("TrolleyExpress.exe", "CitrixWorkspaceApp.exe"):
+                    p = sub / rel
+                    if p.is_file():
+                        candidates.append(p)
+                try:
+                    for p in sub.rglob("TrolleyExpress.exe"):
+                        if p.is_file() and p not in candidates:
+                            candidates.append(p)
+                except OSError:
+                    pass
+        for exe_path in candidates[:4]:
+            try:
+                cp = subprocess.run(
+                    [str(exe_path), "/silent", "/uninstall"],
+                    check=False,
+                    timeout=900,
+                    capture_output=True,
+                    text=True,
+                    shell=False,
+                )
+                tail = ((cp.stdout or "") + (cp.stderr or "")).strip()[:200]
+                msg = f"Citrix nativ ({exe_path.name}): RC={cp.returncode}"
+                if tail:
+                    msg += f" — {tail}"
+                if cp.returncode in (0, 3010, 1641):
+                    return True, msg
+                return False, msg
+            except Exception as exc:  # pylint: disable=broad-except
+                return False, f"Citrix nativ {exe_path.name}: {exc}"
+        return False, ""
+
+    @staticmethod
+    def _append_access_denied_hint(messages: list[str]) -> None:
+        blob = " ".join(messages).lower()
+        if "zugriff verweigert" in blob or "winerror 5" in blob or "access is denied" in blob:
+            messages.append(
+                "Hinweis: Office/365-Deinstall oft nur als Administrator oder mit Microsoft "
+                "Support and Recovery Assistant (SaRA) moeglich."
+            )
+
     def _matches_prev(self, software: SoftwarePackage, prev: SoftwareState, display_name: str) -> bool:
         name = (display_name or "").lower()
         if not name:
             return False
         if software.key == "microsoft_teams" and "teamspeak" in name:
             return False
+        if software.key == "microsoft_teams":
+            if "machine-wide" in name and "teams" in name:
+                return True
+            if "teams" in name and "work or school" in name:
+                return True
         pkg = (prev.package_name or "").lower()
         if pkg and self._contains_term(name, pkg):
             return True

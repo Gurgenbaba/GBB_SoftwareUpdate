@@ -270,14 +270,9 @@ class ChocoClient:
 
     def install(self, package_name: str, *, use_native_installer_ui: bool = False) -> CommandResult:
         extra = ["--notSilent"] if use_native_installer_ui else []
-        return self.run(
-            ["install", package_name, "-y", *extra],
-            hide_console=not use_native_installer_ui,
-        )
+        # choco.exe immer ohne eigenes Konsolenfenster; --notSilent betrifft nur das Kind-Setup.
+        return self.run(["install", package_name, "-y", *extra], hide_console=True)
 
     def upgrade(self, package_name: str, *, use_native_installer_ui: bool = False) -> CommandResult:
         extra = ["--notSilent"] if use_native_installer_ui else []
-        return self.run(
-            ["upgrade", package_name, "-y", *extra],
-            hide_console=not use_native_installer_ui,
-        )
+        return self.run(["upgrade", package_name, "-y", *extra], hide_console=True)
