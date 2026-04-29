@@ -523,3 +523,54 @@ class SystemToolsService:
         else:
             lines.append("OK: Keine offensichtlichen Altpfad-Referenzen gefunden.")
         return SystemActionResult(True, lines)
+
+    def apply_energy_and_screensaver_defaults(self) -> SystemActionResult:
+        """Aktives Energieschema: Deckel = keine Aktion, Standby aus; Bildschirmschoner 15 min (HKCU)."""
+        lines: list[str] = ["Konfiguriere Energieoptionen..."]
+        if platform.system() != "Windows":
+            return SystemActionResult(False, [*lines, "Nur unter Windows verfuegbar."])
+        scheme_res = self._run(["powercfg", "/getactivescheme"], timeout=30)
+        combined = ((scheme_res.stdout or "") + "\n" + (scheme_res.stderr or "")).strip()
+        m = re.search(
+            r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+            combined,
+            re.I,
+        )
+        if not m:
+            lines.append("Aktives Energieschema konnte nicht ermittelt werden (powercfg /getactivescheme).")
+            lines.append(combined[:400] if combined else "(keine Ausgabe)")
+            return SystemActionResult(False, lines)
+        scheme = m.group(1)
+        lines.append(f"Aktives Schema: {scheme}")
+
+        for cmd in (
+            ["powercfg", "/setacvalueindex", scheme, "SUB_BUTTONS", "LIDACTION", "0"],
+            ["powercfg", "/setdcvalueindex", scheme, "SUB_BUTTONS", "LIDACTION", "0"],
+            ["powercfg", "/change", "standby-timeout-ac", "0"],
+            ["powercfg", "/change", "standby-timeout-dc", "0"],
+            ["powercfg", "/setactive", scheme],
+        ):
+            rr = self._run(cmd, timeout=60)
+            tail = ((rr.stdout or "") + (rr.stderr or "")).strip()
+            if rr.returncode != 0:
+                lines.append(f"FEHLER: {' '.join(cmd)} (Code {rr.returncode})")
+                if tail:
+                    lines.append(tail[:400])
+                return SystemActionResult(False, lines)
+            if tail:
+                lines.append(f"{' '.join(cmd)}: {tail[:200]}")
+
+        lines.append("Konfiguriere Bildschirmschoner...")
+        if winreg is None:
+            lines.append("FEHLER: winreg nicht verfuegbar.")
+            return SystemActionResult(False, lines)
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop", 0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, "ScreenSaveActive", 0, winreg.REG_SZ, "1")
+                winreg.SetValueEx(key, "ScreenSaveTimeOut", 0, winreg.REG_SZ, "900")
+        except OSError as exc:
+            lines.append(f"FEHLER: Registry HKCU\\Control Panel\\Desktop: {exc}")
+            return SystemActionResult(False, lines)
+
+        lines.append("Energieoptionen und Bildschirmschoner wurden gesetzt.")
+        return SystemActionResult(True, lines)

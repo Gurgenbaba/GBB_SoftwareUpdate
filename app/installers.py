@@ -4,6 +4,7 @@ import os
 import shlex
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -17,6 +18,9 @@ from .config import INSTALL_TIMEOUT_SECONDS, INTERNAL_INSTALLERS, MAX_CHOCO_RETR
 from .local_source import LocalSourceService
 from .models import ReportEntry, SoftwareState
 
+DownloadProgressCallback = Callable[[int, int | None], None]
+ActivityCallback = Callable[[str, str], None]
+
 INSTALLER_LOCK_WAIT_SECONDS = 30
 INSTALLER_LOCK_MAX_ATTEMPTS = 5
 LOCK_PROCESS_NAMES = (
@@ -25,6 +29,8 @@ LOCK_PROCESS_NAMES = (
     "installer.exe",
     "officeclicktorun.exe",
 )
+
+NATIVE_VENDOR_INSTALL_UI_KEYS = frozenset({"adobe_reader"})
 
 
 class InstallerService:
@@ -45,6 +51,32 @@ class InstallerService:
         self.provider_configs = provider_configs or {}
         self.local_source = local_source_service
         self.prefer_local_source = prefer_local_source
+        self._download_progress: DownloadProgressCallback | None = None
+        self._activity_callback: ActivityCallback | None = None
+        self._prefetched_internal_path: str | None = None
+        self._native_vendor_install_ui: bool = False
+        self._current_software_key: str = ""
+
+    def _emit_activity(self, software: SoftwarePackage, message: str) -> None:
+        if self._activity_callback:
+            self._activity_callback(software.display_name, message)
+
+    def _prefetch_internal_url_candidate(
+        self, software: SoftwarePackage, internal_installers: dict[str, dict[str, Any]]
+    ) -> str | None:
+        if software.primary_package or software.winget_id:
+            return None
+        info = self._resolve_internal_installer_info(software, internal_installers)
+        src = str(info.source or "").strip()
+        if self._is_url_source(src):
+            return src
+        return None
+
+    @staticmethod
+    def _hide_for_internal_subprocess(is_msi: bool, native_ui: bool) -> bool:
+        if is_msi:
+            return True
+        return not native_ui
 
     @staticmethod
     def _subprocess_hidden_kwargs() -> dict[str, Any]:
@@ -89,56 +121,115 @@ class InstallerService:
         resolution_callback: Callable[[str, str | None, str | None], None] | None = None,
         dry_run: bool = False,
         internal_installers: dict[str, dict[str, Any]] | None = None,
+        download_progress_callback: DownloadProgressCallback | None = None,
+        activity_callback: ActivityCallback | None = None,
     ) -> list[ReportEntry]:
         total = len(selected_keys)
         installers = internal_installers if internal_installers is not None else INTERNAL_INSTALLERS
         report_rows: list[ReportEntry] = []
-        for index, key in enumerate(selected_keys, start=1):
-            software = self.software_by_key[key]
-            progress_callback(index - 1, total)
-            if item_start_callback is not None:
-                item_start_callback(key)
-            self.logger.info("%s wird verarbeitet...", software.display_name)
-            previous_state = current_states.get(key, SoftwareState("Nicht geprueft"))
+        self._download_progress = download_progress_callback
+        self._activity_callback = activity_callback
+        prefetch_paths: dict[str, str] = {}
+        prefetch_exc: dict[str, BaseException] = {}
+        prefetch_box: dict[str, threading.Thread | None] = {"thread": None}
 
-            try:
-                action, new_state = self._process_single(software, previous_state, dry_run, installers, resolution_callback)
-            except Exception as exc:  # pylint: disable=broad-except
-                self.logger.exception("Fehler bei %s: %s", software.display_name, exc)
-                action = "Fehlerbehandlung"
-                new_state = SoftwareState(
-                    "Fehler",
-                    detail=str(exc),
-                    package_name=previous_state.package_name,
-                    installed_version=previous_state.installed_version,
-                    available_version=previous_state.available_version,
+        def wait_prefetch() -> None:
+            t = prefetch_box["thread"]
+            if t is not None:
+                t.join(timeout=7200)
+                prefetch_box["thread"] = None
+
+        try:
+            for index, key in enumerate(selected_keys, start=1):
+                wait_prefetch()
+                software = self.software_by_key[key]
+                self._current_software_key = key
+                self._native_vendor_install_ui = key in NATIVE_VENDOR_INSTALL_UI_KEYS
+
+                exc_pref = prefetch_exc.pop(key, None)
+                path_opt = prefetch_paths.pop(key, None)
+                self._prefetched_internal_path = None if exc_pref else path_opt
+                if exc_pref:
+                    self.logger.warning("Hintergrund-Download fuer %s fehlgeschlagen: %s", key, exc_pref)
+
+                progress_callback(index - 1, total)
+                if item_start_callback is not None:
+                    item_start_callback(key)
+                self._emit_activity(software, "Installation / Provider wird ausgefuehrt …")
+                self.logger.info("%s wird verarbeitet...", software.display_name)
+                previous_state = current_states.get(key, SoftwareState("Nicht geprueft"))
+
+                try:
+                    action, new_state = self._process_single(software, previous_state, dry_run, installers, resolution_callback)
+                except Exception as exc:  # pylint: disable=broad-except
+                    self.logger.exception("Fehler bei %s: %s", software.display_name, exc)
+                    action = "Fehlerbehandlung"
+                    new_state = SoftwareState(
+                        "Fehler",
+                        detail=str(exc),
+                        package_name=previous_state.package_name,
+                        installed_version=previous_state.installed_version,
+                        available_version=previous_state.available_version,
+                    )
+                finally:
+                    self._prefetched_internal_path = None
+
+                if path_opt and os.path.isfile(path_opt):
+                    Path(path_opt).unlink(missing_ok=True)
+
+                current_states[key] = new_state
+                status_callback(key, new_state)
+                progress_callback(index, total)
+                if action == "Keine Aktion erforderlich":
+                    result = "OK"
+                else:
+                    result = "OK" if new_state.status not in {"Fehler", "Quelle erforderlich"} else "Fehler"
+                    if dry_run and action.startswith("DRY-RUN"):
+                        result = "DRY-RUN"
+                report_rows.append(
+                    ReportEntry(
+                        software_key=key,
+                        package_name=new_state.package_name or "",
+                        status_before=previous_state.status,
+                        action=action,
+                        status_after=new_state.status,
+                        result=result,
+                        error_message=new_state.detail,
+                        reboot_required="yes" if self.is_reboot_pending() else "no",
+                        provider=new_state.provider or "",
+                        installer_path=new_state.installer_path or "",
+                        installer_sha256=new_state.installer_sha256 or "",
+                    )
                 )
 
-            current_states[key] = new_state
-            status_callback(key, new_state)
-            progress_callback(index, total)
-            if action == "Keine Aktion erforderlich":
-                result = "OK"
-            else:
-                result = "OK" if new_state.status not in {"Fehler", "Quelle erforderlich"} else "Fehler"
-                if dry_run and action.startswith("DRY-RUN"):
-                    result = "DRY-RUN"
-            report_rows.append(
-                ReportEntry(
-                    software_key=key,
-                    package_name=new_state.package_name or "",
-                    status_before=previous_state.status,
-                    action=action,
-                    status_after=new_state.status,
-                    result=result,
-                    error_message=new_state.detail,
-                    reboot_required="yes" if self.is_reboot_pending() else "no",
-                    provider=new_state.provider or "",
-                    installer_path=new_state.installer_path or "",
-                    installer_sha256=new_state.installer_sha256 or "",
-                )
-            )
-        return report_rows
+                if index < len(selected_keys):
+                    next_key = selected_keys[index]
+                    next_sw = self.software_by_key[next_key]
+                    next_url = self._prefetch_internal_url_candidate(next_sw, installers)
+                    if next_url:
+
+                        def bg_pref(k: str = next_key, u: str = next_url) -> None:
+                            try:
+                                pth = self._download_installer_from_url(u, report_progress=False)
+                                prefetch_paths[k] = pth
+                            except BaseException as exc:  # noqa: BLE001
+                                prefetch_exc[k] = exc
+
+                        prefetch_box["thread"] = threading.Thread(target=bg_pref, daemon=True)
+                        prefetch_box["thread"].start()
+
+            return report_rows
+        finally:
+            wait_prefetch()
+            for orphan in list(prefetch_paths.values()):
+                Path(orphan).unlink(missing_ok=True)
+            prefetch_paths.clear()
+            prefetch_exc.clear()
+            self._download_progress = None
+            self._activity_callback = None
+            self._prefetched_internal_path = None
+            self._native_vendor_install_ui = False
+            self._current_software_key = ""
 
     def _no_action_if_current(
         self,
@@ -600,7 +691,11 @@ class InstallerService:
     def _run_choco_upgrade(self, package_name: str, prev: SoftwareState, dry_run: bool) -> tuple[str, SoftwareState]:
         if dry_run:
             return ("DRY-RUN: wuerde upgraden", SoftwareState("Dry-Run (unveraendert)", package_name=package_name, provider="Chocolatey"))
-        result = self._run_with_retry(package_name, "upgrade", package_name)
+        sw = self.software_by_key.get(self._current_software_key)
+        if sw:
+            self._emit_activity(sw, "Chocolatey (Upgrade) — ggf. sichtbares Setup …")
+        native = bool(getattr(self, "_native_vendor_install_ui", False))
+        result = self._run_with_retry(package_name, "upgrade", package_name, native_ui=native)
         return ("Upgrade", SoftwareState("Aktuell" if result.ok else "Fehler", package_name=package_name, detail=self._combine_error(result), provider="Chocolatey"))
 
     def _run_winget_upgrade(self, winget_id: str, prev: SoftwareState, dry_run: bool) -> tuple[str, SoftwareState]:
@@ -610,13 +705,21 @@ class InstallerService:
             bootstrap_result = self.winget.ensure_installed()
             if not bootstrap_result.ok:
                 return ("Upgrade", SoftwareState("Fehler", package_name=winget_id, detail=self._combine_error(bootstrap_result), provider="WinGet"))
-        result = self._run_winget_with_lock_retry("upgrade", winget_id)
+        sw = self.software_by_key.get(self._current_software_key)
+        if sw:
+            self._emit_activity(sw, "WinGet (Upgrade) — interaktives Setup …")
+        interactive = bool(getattr(self, "_native_vendor_install_ui", False))
+        result = self._run_winget_with_lock_retry("upgrade", winget_id, interactive=interactive)
         return ("Upgrade", SoftwareState("Aktuell" if result.ok else "Fehler", package_name=winget_id, detail=self._combine_error(result), provider="WinGet"))
 
     def _run_choco_install(self, package_name: str, prev: SoftwareState, dry_run: bool) -> tuple[str, SoftwareState]:
         if dry_run:
             return ("DRY-RUN: wuerde installieren", SoftwareState("Dry-Run (unveraendert)", package_name=package_name, provider="Chocolatey"))
-        result = self._run_with_retry(package_name, "install", package_name)
+        sw = self.software_by_key.get(self._current_software_key)
+        if sw:
+            self._emit_activity(sw, "Chocolatey — ggf. sichtbares Setup (Adobe etc.) …")
+        native = bool(getattr(self, "_native_vendor_install_ui", False))
+        result = self._run_with_retry(package_name, "install", package_name, native_ui=native)
         return ("Install", SoftwareState("Installiert" if result.ok else "Fehler", package_name=package_name, detail=self._combine_error(result), provider="Chocolatey"))
 
     def _run_winget_install(self, winget_id: str, prev: SoftwareState, dry_run: bool) -> tuple[str, SoftwareState]:
@@ -626,7 +729,11 @@ class InstallerService:
             bootstrap_result = self.winget.ensure_installed()
             if not bootstrap_result.ok:
                 return ("Install", SoftwareState("Fehler", package_name=winget_id, detail=self._combine_error(bootstrap_result), provider="WinGet"))
-        result = self._run_winget_with_lock_retry("install", winget_id)
+        sw = self.software_by_key.get(self._current_software_key)
+        if sw:
+            self._emit_activity(sw, "WinGet — interaktives Setup …")
+        interactive = bool(getattr(self, "_native_vendor_install_ui", False))
+        result = self._run_winget_with_lock_retry("install", winget_id, interactive=interactive)
         return ("Install", SoftwareState("Installiert" if result.ok else "Fehler", package_name=winget_id, detail=self._combine_error(result), provider="WinGet"))
 
     def _find_dynamic_package(self, software: SoftwarePackage) -> str | None:
@@ -702,9 +809,16 @@ class InstallerService:
 
         cmd_source = source_text
         downloaded_file: str | None = None
-        if is_url_source and not dry_run:
+        prefetched = getattr(self, "_prefetched_internal_path", None)
+        if prefetched and os.path.isfile(prefetched):
+            cmd_source = prefetched
+            downloaded_file = prefetched
+            self._emit_activity(software, "Vorbereiteter Firmen-Download — starte Setup …")
+            self.logger.info("%s Installer (vorbereitet): %s", software.display_name, source_text)
+        elif is_url_source and not dry_run:
             try:
-                downloaded_file = self._download_installer_from_url(source_text)
+                self._emit_activity(software, "Download des firmeninternen Installers …")
+                downloaded_file = self._download_installer_from_url(source_text, report_progress=True)
                 cmd_source = downloaded_file
                 self.logger.info("%s Installer aus URL geladen: %s", software.display_name, source_text)
             except Exception as exc:  # pylint: disable=broad-except
@@ -732,8 +846,10 @@ class InstallerService:
             self.logger.info("%s Installation gestartet...", software.display_name)
         self.logger.info("%s aus Firmenquelle installiert: %s", software.display_name, source_text)
         self.logger.info("EXEC: %s", " ".join(cmd))
+        self._emit_activity(software, "Setup-Fenster / Installation …")
         try:
-            completed = self._run_subprocess_with_lock_retry(cmd)
+            hide_win = self._hide_for_internal_subprocess(is_msi, bool(getattr(self, "_native_vendor_install_ui", False)))
+            completed = self._run_subprocess_with_lock_retry(cmd, hide_window=hide_win)
         except subprocess.TimeoutExpired:
             if downloaded_file and os.path.exists(downloaded_file):
                 Path(downloaded_file).unlink(missing_ok=True)
@@ -813,8 +929,13 @@ class InstallerService:
             if not args:
                 self.logger.warning("Keine Silent-Args konfiguriert, Installation kann interaktiv werden.")
             cmd = [str(local_installer), *args] if args else [str(local_installer)]
+        native = bool(getattr(self, "_native_vendor_install_ui", False))
+        if installer_type in {"msi", "ps1"}:
+            hide_w = True
+        else:
+            hide_w = not native
         try:
-            completed = self._run_subprocess_with_lock_retry(cmd)
+            completed = self._run_subprocess_with_lock_retry(cmd, hide_window=hide_w)
         except subprocess.TimeoutExpired:
             return (
                 "Lokal/USB",
@@ -846,17 +967,49 @@ class InstallerService:
         parsed = urllib.parse.urlparse(source)
         return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
 
-    def _download_installer_from_url(self, source: str) -> str:
+    def _download_installer_from_url(self, source: str, *, report_progress: bool = True) -> str:
         parsed = urllib.parse.urlparse(source)
         suffix = Path(parsed.path).suffix or ".exe"
+        chunk_size = 256 * 1024
+        progress_cb = self._download_progress if report_progress else None
         with urllib.request.urlopen(source, timeout=60) as response:
             if response.status >= 400:
                 raise RuntimeError(f"HTTP {response.status}")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-                tmp_file.write(response.read())
-                return tmp_file.name
+            total: int | None = None
+            cl = response.headers.get("Content-Length")
+            if cl:
+                try:
+                    parsed_len = int(cl)
+                    if parsed_len > 0:
+                        total = parsed_len
+                except ValueError:
+                    pass
+            read = 0
+            tmp_path: str | None = None
+            if progress_cb and total:
+                progress_cb(0, total)
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+                    tmp_path = tmp_file.name
+                    while True:
+                        chunk = response.read(chunk_size)
+                        if not chunk:
+                            break
+                        tmp_file.write(chunk)
+                        read += len(chunk)
+                        if progress_cb:
+                            progress_cb(read, total)
+                assert tmp_path is not None
+                return tmp_path
+            except Exception:
+                if tmp_path and os.path.exists(tmp_path):
+                    Path(tmp_path).unlink(missing_ok=True)
+                raise
+            finally:
+                if progress_cb:
+                    progress_cb(-1, None)
 
-    def _run_with_retry(self, display_name: str, action: str, package_name: str):
+    def _run_with_retry(self, display_name: str, action: str, package_name: str, *, native_ui: bool = False):
         if not self.choco.is_choco_installed():
             bootstrap_result = self.choco.ensure_installed()
             if not bootstrap_result.ok:
@@ -865,7 +1018,7 @@ class InstallerService:
 
         last_result = None
         for attempt in range(0, MAX_CHOCO_RETRIES + 1):
-            last_result = self._run_choco_with_lock_retry(action, package_name)
+            last_result = self._run_choco_with_lock_retry(action, package_name, native_ui=native_ui)
             if last_result.ok:
                 return last_result
             if self._is_package_not_found(last_result.stdout, last_result.stderr):
@@ -875,35 +1028,44 @@ class InstallerService:
                 self.logger.warning("Fehler bei %s, erneuter Versuch %s/%s...", display_name, attempt + 1, MAX_CHOCO_RETRIES)
         return last_result
 
-    def _run_choco_with_lock_retry(self, action: str, package_name: str):
-        run_once = self.choco.upgrade if action == "upgrade" else self.choco.install
-        last_result = run_once(package_name)
+    def _run_choco_with_lock_retry(self, action: str, package_name: str, *, native_ui: bool = False):
+        def run_once() -> Any:
+            if action == "upgrade":
+                return self.choco.upgrade(package_name, use_native_installer_ui=native_ui)
+            return self.choco.install(package_name, use_native_installer_ui=native_ui)
+
+        last_result = run_once()
         for _ in range(max(INSTALLER_LOCK_MAX_ATTEMPTS - 1, 0)):
             if not self._is_installer_lock_result(last_result.returncode, last_result.stdout, last_result.stderr):
                 return last_result
             self.logger.warning("Installer-Lock erkannt, warte auf laufende Installation...")
             time.sleep(INSTALLER_LOCK_WAIT_SECONDS)
-            last_result = run_once(package_name)
+            last_result = run_once()
         return last_result
 
-    def _run_winget_with_lock_retry(self, action: str, winget_id: str):
-        run_once = self.winget.upgrade if action == "upgrade" else self.winget.install
-        last_result = run_once(winget_id)
+    def _run_winget_with_lock_retry(self, action: str, winget_id: str, *, interactive: bool = False):
+        def run_once() -> Any:
+            if action == "upgrade":
+                return self.winget.upgrade(winget_id, interactive=interactive)
+            return self.winget.install(winget_id, interactive=interactive)
+
+        last_result = run_once()
         for _ in range(max(INSTALLER_LOCK_MAX_ATTEMPTS - 1, 0)):
             if not self._is_installer_lock_result(last_result.returncode, last_result.stdout, last_result.stderr):
                 return last_result
             self.logger.warning("Installer-Lock erkannt, warte auf laufende Installation...")
             time.sleep(INSTALLER_LOCK_WAIT_SECONDS)
-            last_result = run_once(winget_id)
+            last_result = run_once()
         return last_result
 
-    def _run_subprocess_with_lock_retry(self, cmd: list[str]) -> subprocess.CompletedProcess:
+    def _run_subprocess_with_lock_retry(self, cmd: list[str], *, hide_window: bool = True) -> subprocess.CompletedProcess:
+        sub_kw = self._subprocess_hidden_kwargs() if hide_window else {}
         completed = subprocess.run(
             cmd,
             check=False,
             timeout=INSTALL_TIMEOUT_SECONDS,
             shell=False,
-            **self._subprocess_hidden_kwargs(),
+            **sub_kw,
         )
         for _ in range(max(INSTALLER_LOCK_MAX_ATTEMPTS - 1, 0)):
             if not self._is_installer_lock_result(completed.returncode, "", ""):
@@ -915,7 +1077,7 @@ class InstallerService:
                 check=False,
                 timeout=INSTALL_TIMEOUT_SECONDS,
                 shell=False,
-                **self._subprocess_hidden_kwargs(),
+                **sub_kw,
             )
         return completed
 

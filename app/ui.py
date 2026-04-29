@@ -34,7 +34,7 @@ from .logger import build_logger
 from .models import ReportEntry, SoftwareState
 from .reporting import ReportWriter, pdf_export_available, write_summary_pdf
 from .scanner import SoftwareScanner
-from .system_tools import SystemToolsService
+from .system_tools import SystemActionResult, SystemToolsService
 
 
 class UpdaterApp(ctk.CTk):
@@ -97,6 +97,13 @@ class UpdaterApp(ctk.CTk):
         self.logo_image: PhotoImage | None = None
         self.settings_btn: ctk.CTkButton | None = None
         self._progress_phase = ""
+        self._last_status_message = "Bereit"
+        self._download_progress_caption = ""
+        self._filezilla_buchhaltung: bool | None = None
+        self._install_activity_line = ""
+        self._active_item_display = ""
+        self._last_prog_done = 0
+        self._last_prog_total = 0
         self.filter_segment: ctk.CTkSegmentedButton | None = None
         self.search_var = ctk.StringVar(value="")
         self.health_scroll: ctk.CTkScrollableFrame | None = None
@@ -135,6 +142,7 @@ class UpdaterApp(ctk.CTk):
         self.button_frame: ctk.CTkFrame | None = None
         self.install_choco_btn: ctk.CTkButton | None = None
         self.install_winget_btn: ctk.CTkButton | None = None
+        self.energy_screensaver_btn: ctk.CTkButton | None = None
         self._toolbar_buttons: list[ctk.CTkButton] = []
         self._toolbar_cols: int | None = None
         self._filter_heading: ctk.CTkLabel | None = None
@@ -570,6 +578,18 @@ class UpdaterApp(ctk.CTk):
         self.system_tools_btn = ctk.CTkButton(button_frame, text="Systemverwaltung", command=self._open_system_tools_dialog, **_btn_kw)
         self.system_tools_btn.grid(row=2, column=3, padx=2, pady=(0, 1), sticky="ew")
         self._attach_tooltip(self.system_tools_btn, "Öffnet Safe-Systemtools für Benutzerverwaltung, Profil-Migration und Windows-Updates.")
+        self.energy_screensaver_btn = ctk.CTkButton(
+            button_frame,
+            text="Energie & Bildschirmschoner",
+            command=self._apply_energy_screensaver_defaults,
+            **_btn_kw,
+        )
+        self.energy_screensaver_btn.grid(row=3, column=2, padx=2, pady=(0, 1), sticky="ew")
+        self._attach_tooltip(
+            self.energy_screensaver_btn,
+            "Deckel zu = keine Aktion, Standby aus, Bildschirmschoner 15 Min. "
+            "Energie: aktives Schema (powercfg); Schoner: aktueller Benutzer. Admin oft nötig.",
+        )
         self.install_choco_btn = ctk.CTkButton(
             button_frame, text="Chocolatey installieren", command=self._bootstrap_chocolatey, **_btn_kw
         )
@@ -599,9 +619,12 @@ class UpdaterApp(ctk.CTk):
             self.select_updates_btn,
             self.patch_run_btn,
             self.system_tools_btn,
+            self.energy_screensaver_btn,
             self.install_choco_btn,
             self.install_winget_btn,
         ]
+        if platform.system() != "Windows":
+            self.energy_screensaver_btn.configure(state="disabled")
 
         self.log_box = ctk.CTkTextbox(log_frame, wrap="word", font=ctk.CTkFont(size=10))
         self.log_box.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
@@ -1199,6 +1222,44 @@ class UpdaterApp(ctk.CTk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _apply_energy_screensaver_defaults(self) -> None:
+        if platform.system() != "Windows":
+            messagebox.showinfo(APP_NAME, "Nur unter Windows verfügbar.", parent=self)
+            return
+        if not messagebox.askokcancel(
+            APP_NAME,
+            "Folgendes wird am aktiven Energieschema gesetzt (oft Administrator nötig):\n\n"
+            "• Deckel zu: keine Aktion (Netz/Batterie)\n"
+            "• Standby: nie (Netz/Batterie)\n"
+            "• Bildschirmschoner: ein, 15 Minuten (aktueller Benutzer)\n\n"
+            "Fortfahren?",
+            parent=self,
+        ):
+            return
+        self._set_actions_enabled(False)
+        self._queue_status("Energie & Bildschirmschoner …")
+
+        def worker() -> None:
+            result = self.system_tools.apply_energy_and_screensaver_defaults()
+            self.ui_queue.put(("energy_screensaver_done", result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _energy_screensaver_finished(self, result: SystemActionResult) -> None:
+        try:
+            for line in result.lines:
+                self.logger.info("%s", line)
+            self._queue_status("Bereit" if result.ok else "Energie/Schoner: Fehler")
+            detail = "\n".join(result.lines)
+            if len(detail) > 900:
+                detail = detail[:900] + "\n…"
+            if result.ok:
+                messagebox.showinfo(APP_NAME, detail or "OK", parent=self)
+            else:
+                messagebox.showwarning(APP_NAME, detail or "Fehler", parent=self)
+        finally:
+            self._set_actions_enabled(True)
+
     def _show_about_dialog(self) -> None:
         version_path = EXE_PARENT / "VERSION.txt"
         if not version_path.exists():
@@ -1765,10 +1826,39 @@ class UpdaterApp(ctk.CTk):
         return [key for key, var in self.checkbox_vars.items() if var.get()]
 
     def _select_all(self) -> None:
+        selected_filezilla = False
         for software in self.runtime.visible_catalog:
             key = software.key
             if self.row_visible.get(key, True):
                 self.checkbox_vars[key].set(True)
+                if key == "filezilla":
+                    selected_filezilla = True
+        if not selected_filezilla:
+            self._filezilla_buchhaltung = None
+            return
+        buchhaltung = messagebox.askyesno(
+            APP_NAME,
+            "Alle Programme sind ausgewählt — inklusive FileZilla.\n\n"
+            "Soll FileZilla für die Buchhaltung mit installiert werden?\n\n"
+            "Ja = Buchhaltung (FileZilla bleibt angehakt)\n"
+            "Nein = keine Buchhaltung (FileZilla wird abgewählt, kein Download/Install dafür)",
+            parent=self,
+        )
+        if buchhaltung:
+            self._filezilla_buchhaltung = True
+            self.logger.info("Alle Pakete: FileZilla fuer Buchhaltung mit ausgewaehlt.")
+            self.hint_line.configure(
+                text="FileZilla: Buchhaltung — bleibt in der Auswahl; Hinweis bei Installation im Log."
+            )
+        else:
+            self._filezilla_buchhaltung = None
+            fz_var = self.checkbox_vars.get("filezilla")
+            if fz_var is not None:
+                fz_var.set(False)
+            self.logger.info("Alle Pakete: FileZilla abgewaehlt (keine Buchhaltung).")
+            self.hint_line.configure(
+                text="FileZilla: abgewaehlt (nur bei Buchhaltung mit Alle Pakete auswaehlen)."
+            )
 
     def _select_missing_only(self) -> None:
         for software in self.runtime.visible_catalog:
@@ -2048,6 +2138,12 @@ class UpdaterApp(ctk.CTk):
                 ("progress", {"frac": 0 if total_count == 0 else done / total_count, "done": done, "total": total_count})
             )
 
+        def download_progress_callback(read: int, total: int | None) -> None:
+            self.ui_queue.put(("download_progress", {"read": read, "total": total}))
+
+        def activity_callback(display_name: str, detail: str) -> None:
+            self.ui_queue.put(("install_activity", (display_name, detail)))
+
         def item_start_callback(key: str) -> None:
             self.ui_queue.put(("row_progress_start", key))
 
@@ -2057,6 +2153,11 @@ class UpdaterApp(ctk.CTk):
         dry = self.dry_run_var.get()
 
         def worker() -> None:
+            if mode == "install" and "filezilla" in keys:
+                if self._filezilla_buchhaltung is True:
+                    self.logger.info("FileZilla: Installation im Buchhaltungskontext (per Alle Pakete: Ja).")
+                else:
+                    self.logger.info("FileZilla: Installation ohne Buchhaltungs-Markierung (manuell oder anderer Auswahlweg).")
             if mode == "install" and InstallerService.is_reboot_pending():
                 self.logger.warning("Reboot Pending erkannt: Neustart empfohlen/erforderlich.")
                 self.ui_queue.put(("hint", "Neustart empfohlen/erforderlich"))
@@ -2086,6 +2187,8 @@ class UpdaterApp(ctk.CTk):
                 resolution_callback=resolution_callback,
                 dry_run=dry,
                 internal_installers=self.runtime.internal_installers,
+                download_progress_callback=download_progress_callback,
+                activity_callback=activity_callback,
             ) if mode == "install" else self.uninstaller.process(
                 keys,
                 self.current_states,
@@ -2278,6 +2381,17 @@ class UpdaterApp(ctk.CTk):
             bar.stop()
             bar.set(1.0)
 
+    def _apply_status_line(self) -> None:
+        base = self._last_status_message
+        parts = [base]
+        act = (self._install_activity_line or "").strip()
+        if act:
+            parts.append(act)
+        dl = (self._download_progress_caption or "").strip()
+        if dl:
+            parts.append(dl)
+        self.status_line.configure(text=" · ".join(parts))
+
     def _queue_status(self, text: str) -> None:
         self.ui_queue.put(("status_line", text))
         self.logger.info(text)
@@ -2301,17 +2415,59 @@ class UpdaterApp(ctk.CTk):
                 break
 
             if action == "status_line":
-                self.status_line.configure(text=str(payload))
+                self._last_status_message = str(payload)
+                self._apply_status_line()
+            elif action == "install_activity" and isinstance(payload, tuple) and len(payload) == 2:
+                dn, det = str(payload[0]), str(payload[1])
+                self._install_activity_line = f"{dn}: {det}" if dn else det
+                self._apply_status_line()
+                d, t = self._last_prog_done, self._last_prog_total
+                if t > 0 or d > 0:
+                    phase = self._progress_phase or "bearbeitet"
+                    cur = (self._active_item_display or "").strip()
+                    if cur:
+                        self.progress_count_label.configure(text=f"{d}/{t} · {cur} · {phase}")
+                    else:
+                        self.progress_count_label.configure(text=f"{d}/{t} Programme {phase}")
+            elif action == "download_progress" and isinstance(payload, dict):
+                read = int(payload.get("read", 0))
+                if read < 0:
+                    self._download_progress_caption = ""
+                else:
+                    raw_total = payload.get("total")
+                    total_bytes: int | None
+                    if raw_total is None:
+                        total_bytes = None
+                    else:
+                        try:
+                            total_bytes = int(raw_total)
+                        except (TypeError, ValueError):
+                            total_bytes = None
+                    if total_bytes is not None and total_bytes > 0:
+                        rem = max(0.0, (total_bytes - read) / (1024 * 1024))
+                        self._download_progress_caption = f"Download: {rem:.1f} MB verbleibend"
+                    else:
+                        loaded = read / (1024 * 1024)
+                        self._download_progress_caption = f"Download: {loaded:.1f} MB geladen (Groesse unbekannt)"
+                self._apply_status_line()
             elif action == "software_row":
                 key, state = payload  # type: ignore[misc]
                 self._apply_row_state(str(key), state)
                 self._apply_filter()
             elif action == "row_progress_reset":
                 keys = payload if isinstance(payload, list) else []
+                self._active_item_display = ""
+                self._install_activity_line = ""
+                self._apply_status_line()
                 for key in keys:
                     self._set_row_progress_reset(str(key))
             elif action == "row_progress_start":
-                self._set_row_progress_start(str(payload))
+                self._download_progress_caption = ""
+                k = str(payload)
+                pkg = SOFTWARE_BY_KEY.get(k)
+                self._active_item_display = pkg.display_name if pkg else k
+                self._apply_status_line()
+                self._set_row_progress_start(k)
             elif action == "resolved_source" and isinstance(payload, dict):
                 update_provider_resolved_source(
                     str(payload.get("key", "")),
@@ -2321,12 +2477,20 @@ class UpdaterApp(ctk.CTk):
                 )
             elif action == "progress":
                 if isinstance(payload, dict):
+                    self._download_progress_caption = ""
+                    self._apply_status_line()
                     frac = float(payload.get("frac", 0.0))
                     done = int(payload.get("done", 0))
                     total = int(payload.get("total", 0))
+                    self._last_prog_done = done
+                    self._last_prog_total = total
                     self.progress.set(frac)
                     phase = self._progress_phase or "bearbeitet"
-                    self.progress_count_label.configure(text=f"{done}/{total} Programme {phase}")
+                    cur = (self._active_item_display or "").strip()
+                    if cur:
+                        self.progress_count_label.configure(text=f"{done}/{total} · {cur} · {phase}")
+                    else:
+                        self.progress_count_label.configure(text=f"{done}/{total} Programme {phase}")
                 else:
                     self.progress.set(float(payload))
             elif action == "warning":
@@ -2353,6 +2517,8 @@ class UpdaterApp(ctk.CTk):
                 self.after(0, _show_info)
             elif action == "summary_dialog" and isinstance(payload, dict):
                 self._show_completion_dialog(payload)
+            elif action == "energy_screensaver_done" and isinstance(payload, SystemActionResult):
+                self.after(0, lambda r=payload: self._energy_screensaver_finished(r))
             elif action == "bootstrap_done" and isinstance(payload, dict):
                 self._set_actions_enabled(True)
                 self._refresh_provider_quick_panel()
@@ -2371,6 +2537,10 @@ class UpdaterApp(ctk.CTk):
 
                 self.after(0, _show_bootstrap)
             elif action == "enable_actions":
+                if bool(payload):
+                    self._install_activity_line = ""
+                    self._active_item_display = ""
+                    self._apply_status_line()
                 self._set_actions_enabled(bool(payload))
             elif action == "hint":
                 self.hint_line.configure(text=str(payload))

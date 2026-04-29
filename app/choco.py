@@ -83,10 +83,17 @@ class ChocoClient:
             startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
         return {"creationflags": creationflags, "startupinfo": startupinfo}
 
-    def run(self, args: list[str], timeout: int = COMMAND_TIMEOUT_SECONDS) -> CommandResult:
+    def run(
+        self,
+        args: list[str],
+        timeout: int = COMMAND_TIMEOUT_SECONDS,
+        *,
+        hide_console: bool = True,
+    ) -> CommandResult:
         cmd = [self._choco_argv0(), *args]
         rendered = " ".join(shlex.quote(part) for part in cmd)
         self.logger.info("EXEC: %s", rendered)
+        sub_kw: dict[str, object] = self._hidden_subprocess_kwargs() if hide_console else {}
         try:
             completed = subprocess.run(
                 cmd,
@@ -95,7 +102,7 @@ class ChocoClient:
                 timeout=timeout,
                 check=False,
                 shell=False,
-                **self._hidden_subprocess_kwargs(),
+                **sub_kw,
             )
             return CommandResult(
                 command=rendered,
@@ -261,8 +268,16 @@ class ChocoClient:
                 matches.append((name_clean, version_clean))
         return matches
 
-    def install(self, package_name: str) -> CommandResult:
-        return self.run(["install", package_name, "-y"])
+    def install(self, package_name: str, *, use_native_installer_ui: bool = False) -> CommandResult:
+        extra = ["--notSilent"] if use_native_installer_ui else []
+        return self.run(
+            ["install", package_name, "-y", *extra],
+            hide_console=not use_native_installer_ui,
+        )
 
-    def upgrade(self, package_name: str) -> CommandResult:
-        return self.run(["upgrade", package_name, "-y"])
+    def upgrade(self, package_name: str, *, use_native_installer_ui: bool = False) -> CommandResult:
+        extra = ["--notSilent"] if use_native_installer_ui else []
+        return self.run(
+            ["upgrade", package_name, "-y", *extra],
+            hide_console=not use_native_installer_ui,
+        )

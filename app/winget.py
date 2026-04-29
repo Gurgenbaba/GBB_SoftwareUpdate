@@ -56,10 +56,17 @@ class WingetService:
             startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
         return {"creationflags": creationflags, "startupinfo": startupinfo}
 
-    def _run(self, args: list[str], timeout: int = COMMAND_TIMEOUT_SECONDS) -> CommandResult:
+    def _run(
+        self,
+        args: list[str],
+        timeout: int = COMMAND_TIMEOUT_SECONDS,
+        *,
+        hide_console: bool = True,
+    ) -> CommandResult:
         cmd = [self._winget_argv0(), *args]
         rendered = " ".join(shlex.quote(part) for part in cmd)
         self.logger.info("EXEC: %s", rendered)
+        sub_kw: dict[str, object] = self._hidden_subprocess_kwargs() if hide_console else {}
         try:
             completed = subprocess.run(
                 cmd,
@@ -68,7 +75,7 @@ class WingetService:
                 timeout=timeout,
                 check=False,
                 shell=False,
-                **self._hidden_subprocess_kwargs(),
+                **sub_kw,
             )
             return CommandResult(
                 command=rendered,
@@ -189,17 +196,51 @@ class WingetService:
         text = f"{info_result.stdout}\n{info_result.stderr}".lower()
         return package_id.lower() in text
 
-    def install(self, package_id: str) -> CommandResult:
-        return self._run(
-            ["install", "-e", "--id", package_id, "--silent", "--accept-package-agreements", "--accept-source-agreements"],
-            timeout=INSTALL_TIMEOUT_SECONDS,
-        )
+    def install(self, package_id: str, *, interactive: bool = False) -> CommandResult:
+        if interactive:
+            args = [
+                "install",
+                "-e",
+                "--id",
+                package_id,
+                "--interactive",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+            ]
+        else:
+            args = [
+                "install",
+                "-e",
+                "--id",
+                package_id,
+                "--silent",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+            ]
+        return self._run(args, timeout=INSTALL_TIMEOUT_SECONDS, hide_console=not interactive)
 
-    def upgrade(self, package_id: str) -> CommandResult:
-        return self._run(
-            ["upgrade", "-e", "--id", package_id, "--silent", "--accept-package-agreements", "--accept-source-agreements"],
-            timeout=INSTALL_TIMEOUT_SECONDS,
-        )
+    def upgrade(self, package_id: str, *, interactive: bool = False) -> CommandResult:
+        if interactive:
+            args = [
+                "upgrade",
+                "-e",
+                "--id",
+                package_id,
+                "--interactive",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+            ]
+        else:
+            args = [
+                "upgrade",
+                "-e",
+                "--id",
+                package_id,
+                "--silent",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+            ]
+        return self._run(args, timeout=INSTALL_TIMEOUT_SECONDS, hide_console=not interactive)
 
     def uninstall(self, package_id: str) -> CommandResult:
         return self._run(
