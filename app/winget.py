@@ -87,7 +87,10 @@ class WingetService:
         except subprocess.TimeoutExpired as exc:
             stdout = (exc.stdout or "").strip() if isinstance(exc.stdout, str) else ""
             stderr = (exc.stderr or "").strip() if isinstance(exc.stderr, str) else ""
-            self.logger.error("Timeout bei Kommando: %s", rendered)
+            self.logger.warning(
+                "Kommando-Timeout (Kind-Installer kann noch laufen; ggf. verifiziert die App nach): %s",
+                rendered,
+            )
             return CommandResult(command=rendered, returncode=1, stdout=stdout, stderr=stderr, timed_out=True)
 
     def ensure_installed(self) -> CommandResult:

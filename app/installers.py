@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import csv
+import fnmatch
+import io
 import os
 import re
 import shlex
@@ -15,20 +18,35 @@ import winreg
 from pathlib import Path
 from typing import Any, Callable
 
+from .choco import CommandResult
 from .config import INSTALL_TIMEOUT_SECONDS, INTERNAL_INSTALLERS, MAX_CHOCO_RETRIES, SOFTWARE_BY_KEY, SoftwarePackage
 from .local_source import LocalSourceService
 from .models import ReportEntry, SoftwareState
 
 DownloadProgressCallback = Callable[[int, int | None], None]
-ActivityCallback = Callable[[str, str], None]
+ActivityCallback = Callable[[str, str, str | None], None]
 
 INSTALLER_LOCK_WAIT_SECONDS = 30
 INSTALLER_LOCK_MAX_ATTEMPTS = 5
-LOCK_PROCESS_NAMES = (
-    "msiexec.exe",
-    "setup.exe",
-    "installer.exe",
-    "officeclicktorun.exe",
+LOCK_PROCESS_NAMES_EXACT = frozenset(
+    {
+        "msiexec.exe",
+        "setup.exe",
+        "installer.exe",
+        "install.exe",
+        "update.exe",
+        "officeclicktorun.exe",
+        "adobearm.exe",
+        "reader_sl.exe",
+    }
+)
+LOCK_PROCESS_GLOBS = (
+    "acro*.exe",
+    "acrobat*.exe",
+    "reader*.exe",
+    "adobe*.exe",
+    "teams*.exe",
+    "ccmsetup.exe",
 )
 
 NATIVE_VENDOR_INSTALL_UI_KEYS = frozenset({"adobe_reader"})
@@ -44,6 +62,11 @@ class InstallerService:
         provider_configs: dict[str, Any] | None = None,
         local_source_service: LocalSourceService | None = None,
         prefer_local_source: bool = False,
+        scanner=None,
+        installer_settle_wait_seconds: int = 60,
+        installer_verify_after_timeout: bool = True,
+        installer_verify_poll_interval_seconds: int = 10,
+        installer_verify_poll_max_seconds: int = 180,
     ) -> None:
         self.choco = choco_client
         self.winget = winget_client
@@ -52,15 +75,226 @@ class InstallerService:
         self.provider_configs = provider_configs or {}
         self.local_source = local_source_service
         self.prefer_local_source = prefer_local_source
+        self.scanner = scanner
+        self._installer_settle_wait_seconds = max(0, int(installer_settle_wait_seconds))
+        self._installer_verify_after_timeout = bool(installer_verify_after_timeout)
+        self._installer_verify_poll_interval_seconds = max(1, int(installer_verify_poll_interval_seconds))
+        self._installer_verify_poll_max_seconds = max(0, int(installer_verify_poll_max_seconds))
         self._download_progress: DownloadProgressCallback | None = None
         self._activity_callback: ActivityCallback | None = None
+        self._status_callback: Callable[[str, SoftwareState], None] | None = None
+        self._install_current_states: dict[str, SoftwareState] | None = None
         self._prefetched_internal_path: str | None = None
         self._native_vendor_install_ui: bool = False
         self._current_software_key: str = ""
 
-    def _emit_activity(self, software: SoftwarePackage, message: str) -> None:
+    def _emit_activity(self, software: SoftwarePackage, message: str, progress_phase: str | None = None) -> None:
         if self._activity_callback:
-            self._activity_callback(software.display_name, message)
+            self._activity_callback(software.display_name, message, progress_phase)
+
+    def _emit_verification_row_prueft(self) -> None:
+        key = self._current_software_key
+        if not key or not self._status_callback:
+            return
+        prev = (self._install_current_states or {}).get(key, SoftwareState("Nicht geprueft"))
+        self._status_callback(
+            key,
+            SoftwareState(
+                "PRUEFT",
+                package_name=prev.package_name,
+                detail="Installer läuft im Hintergrund – Abschluss wird geprüft...",
+                installed_version=prev.installed_version,
+                available_version=prev.available_version,
+                provider=prev.provider or "",
+            ),
+        )
+
+    @staticmethod
+    def _chocolatey_lock_file_present() -> bool:
+        base = Path(os.environ.get("ChocolateyInstall", r"C:\ProgramData\chocolatey"))
+        for rel in ("lib-chocolatey.lock", "chocolatey-in-progress.lock"):
+            try:
+                if (base / rel).is_file():
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def _wait_installer_settle(self, max_seconds: int | None = None) -> None:
+        limit = self._installer_settle_wait_seconds if max_seconds is None else max(0, min(int(max_seconds), 600))
+        if limit <= 0:
+            return
+        step = 2
+        elapsed = 0
+        while elapsed < limit:
+            if not self._has_installer_lock_processes() and not self._chocolatey_lock_file_present():
+                if elapsed > 0:
+                    self.logger.info("[INSTALL] Installer-Leerlauf nach %ss erreicht.", elapsed)
+                return
+            time.sleep(step)
+            elapsed += step
+        self.logger.info(
+            "[INSTALL] Settle-Wartezeit (%ss) abgelaufen; Scanner-Verifikation folgt trotzdem.",
+            limit,
+        )
+
+    def _needs_background_poll(self, result: CommandResult) -> bool:
+        if result.ok:
+            return False
+        if result.timed_out:
+            return True
+        return self._is_installer_lock_result(result.returncode, result.stdout, result.stderr, timed_out=False)
+
+    def _installer_lock_active(self, provider: str) -> bool:
+        proc = self._has_installer_lock_processes()
+        if provider == "chocolatey":
+            return proc or self._chocolatey_lock_file_present()
+        return proc
+
+    @staticmethod
+    def _status_is_installed_state(st: SoftwareState | None) -> bool:
+        if not st:
+            return False
+        return (st.status or "") in ("Aktuell", "Installiert", "Update verfuegbar")
+
+    def _scan_state_for_current(self) -> SoftwareState | None:
+        key = self._current_software_key
+        if not self.scanner or not key:
+            return None
+        try:
+            return self.scanner.scan().get(key)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.logger.warning("[INSTALL-VERIFY] Scanner fehlgeschlagen: %s", exc)
+            return None
+
+    def _success_verified_result(self, initial: CommandResult, msg_ok: str) -> CommandResult:
+        self.logger.info("[INSTALL-VERIFY] success after timeout verification")
+        sw = self.software_by_key.get(self._current_software_key)
+        if sw:
+            self._emit_activity(sw, msg_ok)
+        return CommandResult(
+            command=initial.command,
+            returncode=0,
+            stdout=msg_ok,
+            stderr=(initial.stderr or initial.stdout or "")[:500],
+            timed_out=False,
+            verified_after_timeout=True,
+        )
+
+    def _single_retry_after_poll(
+        self,
+        provider: str,
+        run_once: Callable[[], CommandResult],
+        initial: CommandResult,
+    ) -> CommandResult:
+        sw = self.software_by_key.get(self._current_software_key)
+        disc = sw.display_name if sw else provider
+        self.logger.info("[INSTALL-VERIFY] %s: Lock beendet — ein erneuter %s-Versuch.", disc, provider)
+        retry = run_once()
+        if retry.ok:
+            return retry
+        st = self._scan_state_for_current()
+        if self._status_is_installed_state(st):
+            return self._success_verified_result(initial, "Installation erfolgreich verifiziert.")
+        fail_msg = "Installer abgeschlossen, aber Programm nicht erkannt."
+        if sw:
+            self._emit_activity(sw, fail_msg)
+        detail = (retry.stderr or retry.stdout or "").strip()[:400]
+        return CommandResult(
+            command=retry.command,
+            returncode=retry.returncode or 1,
+            stdout=retry.stdout,
+            stderr=f"{fail_msg} | {detail}"[:900],
+            timed_out=retry.timed_out,
+            recovery_exhausted=True,
+        )
+
+    def _poll_install_completion(
+        self,
+        provider: str,
+        run_once: Callable[[], CommandResult],
+        initial: CommandResult,
+    ) -> CommandResult:
+        if not self._installer_verify_after_timeout or not self.scanner:
+            return self._run_provider_lock_retries_legacy(provider, run_once, initial)
+        key = self._current_software_key
+        sw = self.software_by_key.get(key) if key else None
+        disc = sw.display_name if sw else provider
+        self.logger.info("[INSTALL] Installer läuft noch, prüfe Abschluss... (%s)", provider)
+        self.logger.info("[INSTALL-VERIFY] %s: pending_verification", disc)
+        self._emit_verification_row_prueft()
+        if sw:
+            self._emit_activity(
+                sw,
+                "Hintergrundprüfung: Abschluss wird geprüft…",
+                "Hintergrundprüfung",
+            )
+        interval = self._installer_verify_poll_interval_seconds
+        poll_max = self._installer_verify_poll_max_seconds
+        deadline = time.monotonic() + poll_max
+        est = max(1, (poll_max + interval - 1) // interval) if poll_max > 0 else 1
+        msg_ok = "Installation erfolgreich verifiziert."
+        n = 0
+        while poll_max > 0 and time.monotonic() < deadline:
+            n += 1
+            time.sleep(interval)
+            st = self._scan_state_for_current()
+            status = st.status if st else "?"
+            prov = (st.provider or "") if st else ""
+            self.logger.info(
+                "[INSTALL-VERIFY] %s: polling %s/%s... status=%s provider=%s",
+                disc,
+                n,
+                est,
+                status,
+                prov,
+            )
+            if self._status_is_installed_state(st):
+                return self._success_verified_result(initial, msg_ok)
+            if not self._installer_lock_active(provider):
+                return self._single_retry_after_poll(provider, run_once, initial)
+        st = self._scan_state_for_current()
+        if self._status_is_installed_state(st):
+            return self._success_verified_result(initial, msg_ok)
+        if self._installer_lock_active(provider):
+            msg = (
+                f"Installation-Timeout: Hintergrund-Installer ({provider}) nach {poll_max}s "
+                "noch aktiv oder Programm nicht erkannt."
+            )
+            self.logger.error("[INSTALL-VERIFY] %s", msg)
+            if sw:
+                self._emit_activity(sw, "Installer abgeschlossen, aber Programm nicht erkannt.")
+            return CommandResult(
+                initial.command,
+                1,
+                initial.stdout,
+                msg[:600],
+                timed_out=True,
+                recovery_exhausted=True,
+            )
+        return self._single_retry_after_poll(provider, run_once, initial)
+
+    def _run_provider_lock_retries_legacy(
+        self,
+        provider: str,
+        run_once: Callable[[], CommandResult],
+        last_result: CommandResult,
+    ) -> CommandResult:
+        _ = provider
+        for _ in range(max(INSTALLER_LOCK_MAX_ATTEMPTS - 1, 0)):
+            if not self._is_installer_lock_result(
+                last_result.returncode,
+                last_result.stdout,
+                last_result.stderr,
+                timed_out=bool(last_result.timed_out),
+            ):
+                return last_result
+            self.logger.warning("Installer-Lock erkannt, warte auf laufende Installation...")
+            time.sleep(INSTALLER_LOCK_WAIT_SECONDS)
+            last_result = run_once()
+            if last_result.ok:
+                return last_result
+        return last_result
 
     @staticmethod
     def _hide_for_internal_subprocess(is_msi: bool, native_ui: bool) -> bool:
@@ -118,6 +352,8 @@ class InstallerService:
         report_rows: list[ReportEntry] = []
         self._download_progress = download_progress_callback
         self._activity_callback = activity_callback
+        self._status_callback = status_callback
+        self._install_current_states = current_states
 
         try:
             for index, key in enumerate(selected_keys, start=1):
@@ -184,6 +420,8 @@ class InstallerService:
         finally:
             self._download_progress = None
             self._activity_callback = None
+            self._status_callback = None
+            self._install_current_states = None
             self._prefetched_internal_path = None
             self._native_vendor_install_ui = False
             self._current_software_key = ""
@@ -1072,8 +1310,19 @@ class InstallerService:
 
         last_result = None
         for attempt in range(0, MAX_CHOCO_RETRIES + 1):
+            if attempt > 0:
+                self.logger.warning(
+                    "[INSTALL] Chocolatey erneuter Versuch %s/%s fuer %s — warte auf laufende Setups...",
+                    attempt,
+                    MAX_CHOCO_RETRIES,
+                    display_name,
+                )
+                time.sleep(5)
+                self._wait_installer_settle(max_seconds=min(45, self._installer_settle_wait_seconds))
             last_result = self._run_choco_with_lock_retry(action, package_name, native_ui=native_ui)
             if last_result.ok:
+                return last_result
+            if getattr(last_result, "recovery_exhausted", False):
                 return last_result
             if self._is_package_not_found(last_result.stdout, last_result.stderr):
                 self.logger.error("Kein Retry fuer %s: package not found.", display_name)
@@ -1083,34 +1332,30 @@ class InstallerService:
         return last_result
 
     def _run_choco_with_lock_retry(self, action: str, package_name: str, *, native_ui: bool = False):
-        def run_once() -> Any:
+        def run_once() -> CommandResult:
             if action == "upgrade":
                 return self.choco.upgrade(package_name, use_native_installer_ui=native_ui)
             return self.choco.install(package_name, use_native_installer_ui=native_ui)
 
         last_result = run_once()
-        for _ in range(max(INSTALLER_LOCK_MAX_ATTEMPTS - 1, 0)):
-            if not self._is_installer_lock_result(last_result.returncode, last_result.stdout, last_result.stderr):
-                return last_result
-            self.logger.warning("Installer-Lock erkannt, warte auf laufende Installation...")
-            time.sleep(INSTALLER_LOCK_WAIT_SECONDS)
-            last_result = run_once()
-        return last_result
+        if last_result.ok:
+            return last_result
+        if self._needs_background_poll(last_result):
+            return self._poll_install_completion("chocolatey", run_once, last_result)
+        return self._run_provider_lock_retries_legacy("chocolatey", run_once, last_result)
 
     def _run_winget_with_lock_retry(self, action: str, winget_id: str, *, interactive: bool = False):
-        def run_once() -> Any:
+        def run_once() -> CommandResult:
             if action == "upgrade":
                 return self.winget.upgrade(winget_id, interactive=interactive)
             return self.winget.install(winget_id, interactive=interactive)
 
         last_result = run_once()
-        for _ in range(max(INSTALLER_LOCK_MAX_ATTEMPTS - 1, 0)):
-            if not self._is_installer_lock_result(last_result.returncode, last_result.stdout, last_result.stderr):
-                return last_result
-            self.logger.warning("Installer-Lock erkannt, warte auf laufende Installation...")
-            time.sleep(INSTALLER_LOCK_WAIT_SECONDS)
-            last_result = run_once()
-        return last_result
+        if last_result.ok:
+            return last_result
+        if self._needs_background_poll(last_result):
+            return self._poll_install_completion("winget", run_once, last_result)
+        return self._run_provider_lock_retries_legacy("winget", run_once, last_result)
 
     def _run_subprocess_with_lock_retry(self, cmd: list[str], *, hide_window: bool = True) -> subprocess.CompletedProcess:
         sub_kw = self._subprocess_hidden_kwargs() if hide_window else {}
@@ -1122,7 +1367,7 @@ class InstallerService:
             **sub_kw,
         )
         for _ in range(max(INSTALLER_LOCK_MAX_ATTEMPTS - 1, 0)):
-            if not self._is_installer_lock_result(completed.returncode, "", ""):
+            if not self._is_installer_lock_result(completed.returncode, "", "", timed_out=False):
                 return completed
             self.logger.warning("Installer-Lock erkannt, warte auf laufende Installation...")
             time.sleep(INSTALLER_LOCK_WAIT_SECONDS)
@@ -1354,13 +1599,31 @@ class InstallerService:
         lowered = (text or "").lower()
         return "hash" in lowered and "mismatch" in lowered
 
-    def _is_installer_lock_result(self, returncode: int, stdout: str, stderr: str) -> bool:
+    def _is_installer_lock_result(
+        self, returncode: int, stdout: str, stderr: str, *, timed_out: bool = False
+    ) -> bool:
+        if timed_out:
+            return False
         merged = f"{stdout}\n{stderr}".lower()
         if returncode == 1618 or "1618" in merged:
             return True
         if "another installation is already in progress" in merged:
             return True
         return self._has_installer_lock_processes()
+
+    @staticmethod
+    def _process_name_is_installer_lock(process_name: str) -> bool:
+        n = (process_name or "").strip().lower()
+        if not n:
+            return False
+        if n in LOCK_PROCESS_NAMES_EXACT:
+            return True
+        for pat in LOCK_PROCESS_GLOBS:
+            if fnmatch.fnmatch(n, pat.lower()):
+                return True
+        if "teams" in n and n.endswith(".exe"):
+            return True
+        return False
 
     @staticmethod
     def _has_installer_lock_processes() -> bool:
@@ -1380,11 +1643,17 @@ class InstallerService:
             return False
         lines = (completed.stdout or "").splitlines()
         for line in lines:
-            clean = line.strip().strip('"')
-            if not clean:
+            raw = line.strip()
+            if not raw:
                 continue
-            process_name = clean.split('","')[0].lower()
-            if process_name in LOCK_PROCESS_NAMES:
+            try:
+                row = next(csv.reader(io.StringIO(raw)), None)
+            except csv.Error:
+                continue
+            if not row:
+                continue
+            process_name = (row[0] or "").strip('"')
+            if InstallerService._process_name_is_installer_lock(process_name):
                 return True
         return False
 
@@ -1425,5 +1694,9 @@ class InstallerService:
 
     @staticmethod
     def _combine_error(result) -> str:
+        if getattr(result, "verified_after_timeout", False) and (result.stdout or "").strip():
+            return str(result.stdout).strip()[:220]
+        if getattr(result, "recovery_exhausted", False):
+            return (result.stderr or result.stdout or "Installation fehlgeschlagen.").strip()[:220]
         text = result.stderr or result.stdout
         return text[:220]

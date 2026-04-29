@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -13,6 +14,18 @@ except ImportError:  # pragma: no cover - Windows only
 
 from .config import SOFTWARE_ALIASES, SOFTWARE_CATALOG, SoftwarePackage
 from .models import SoftwareState
+
+# Phrase-only registry display matching (substring, lowercased). Avoids "teams" matching "TeamSpeak".
+_REGISTRY_STRICT_DISPLAY_PHRASES: dict[str, tuple[str, ...]] = {
+    "microsoft_teams": (
+        "microsoft teams",
+        "msteams",
+        "ms teams",
+        "teams machine-wide",
+        "teams work or school",
+    ),
+    "teamspeak": ("teamspeak", "team speak"),
+}
 
 
 @dataclass(frozen=True)
@@ -113,13 +126,33 @@ class SoftwareScanner:
         return None
 
     @staticmethod
+    def _registry_phrase_list_matches(lowered: str, phrases: tuple[str, ...]) -> bool:
+        return any(p and p in lowered for p in phrases)
+
+    @staticmethod
+    def _registry_term_matches(term: str, lowered: str) -> bool:
+        """Multi-word terms: substring match. Single-token: whole-token match (no 'teams' inside 'teamspeak')."""
+        t = term.strip().lower()
+        if not t:
+            return False
+        if " " in t:
+            return t in lowered
+        return re.search(rf"(?<!\w){re.escape(t)}(?!\w)", lowered, flags=re.IGNORECASE) is not None
+
+    @staticmethod
     def _registry_display_matches(software: SoftwarePackage, display_name: str) -> bool:
         lowered = str(display_name or "").lower()
         if not lowered:
             return False
+        strict = _REGISTRY_STRICT_DISPLAY_PHRASES.get(software.key)
+        if strict is not None:
+            return SoftwareScanner._registry_phrase_list_matches(lowered, strict)
         keywords = tuple(word.lower() for word in software.registry_keywords)
         aliases = tuple(word.lower() for word in SOFTWARE_ALIASES.get(software.key, ()))
-        return any(k in lowered for k in keywords) or any(a in lowered for a in aliases)
+        for term in keywords + aliases:
+            if SoftwareScanner._registry_term_matches(term, lowered):
+                return True
+        return False
 
     @staticmethod
     def registry_entry_signals_real_install(entry: dict[str, str]) -> bool:
@@ -341,7 +374,7 @@ class SoftwareScanner:
             dn = str(entry.get("display_name", "")).lower()
             if "machine-wide" not in dn and "machine wide" not in dn:
                 continue
-            if "teams" not in dn:
+            if not re.search(r"(?<!\w)teams(?!\w)", dn, flags=re.IGNORECASE):
                 continue
             if SoftwareScanner.registry_entry_signals_real_install(entry):
                 return True

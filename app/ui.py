@@ -33,6 +33,7 @@ from .json_config import (
 from .logger import build_logger
 from .models import ReportEntry, SoftwareState
 from .reporting import ReportWriter, pdf_export_available, write_summary_pdf
+from .result_normalization import dialog_detail_lines, format_install_summary_lines, format_scan_summary_lines
 from .residue_cleanup import apply_selected_cleanup, run_residue_cleanup_phase
 from .scanner import SoftwareScanner
 from .system_tools import SystemActionResult, SystemToolsService
@@ -79,6 +80,11 @@ class UpdaterApp(ctk.CTk):
             provider_configs=self.runtime.software_providers,
             local_source_service=self.local_source,
             prefer_local_source=self.runtime.local_source_prefer_local,
+            scanner=self.scanner,
+            installer_settle_wait_seconds=self.runtime.installer_settle_wait_seconds,
+            installer_verify_after_timeout=self.runtime.installer_verify_after_timeout,
+            installer_verify_poll_interval_seconds=self.runtime.installer_verify_poll_interval_seconds,
+            installer_verify_poll_max_seconds=self.runtime.installer_verify_poll_max_seconds,
         )
         self.uninstaller = UninstallerService(
             self.choco,
@@ -1033,7 +1039,9 @@ class UpdaterApp(ctk.CTk):
         if mode == "Fehlend":
             return st == "Nicht installiert"
         if mode == "Fehler":
-            return "Fehler" in st or st == "Quelle erforderlich"
+            if st in ("Quelle erforderlich", "PRUEFT"):
+                return False
+            return "Fehler" in st
         return True
 
     def _row_matches_search(self, key: str) -> bool:
@@ -1073,12 +1081,20 @@ class UpdaterApp(ctk.CTk):
         self.provider_labels[key].configure(text=state.provider or "—")
         self.ver_inst_labels[key].configure(text=state.installed_version or "—")
         self.ver_avail_labels[key].configure(text=state.available_version or "—")
-        self._set_row_progress_done(key)
+        self._progress_phase = "bearbeitet"
+        if state.status == "PRUEFT":
+            self._set_row_progress_start(key)
+        else:
+            self._set_row_progress_done(key)
 
     @staticmethod
     def _status_badge_style(state: SoftwareState) -> tuple[str, str, str]:
         st = state.status
-        if "fehler" in st.lower() or st == "Quelle erforderlich":
+        if st == "PRUEFT":
+            return "PRUEFT", "#8a6a2a", "#fff8e6"
+        if st == "Quelle erforderlich":
+            return "QUELLE", "#7a6a2b", "#f5f1e0"
+        if "fehler" in st.lower():
             return "FEHLER", "#7a3240", "#f8e9ed"
         if "dry-run" in st.lower():
             return "DRY-RUN", "#756847", "#f7f2e6"
@@ -1768,6 +1784,11 @@ class UpdaterApp(ctk.CTk):
                 provider_configs=self.runtime.software_providers,
                 local_source_service=self.local_source,
                 prefer_local_source=self.runtime.local_source_prefer_local,
+                scanner=self.scanner,
+                installer_settle_wait_seconds=self.runtime.installer_settle_wait_seconds,
+                installer_verify_after_timeout=self.runtime.installer_verify_after_timeout,
+                installer_verify_poll_interval_seconds=self.runtime.installer_verify_poll_interval_seconds,
+                installer_verify_poll_max_seconds=self.runtime.installer_verify_poll_max_seconds,
             )
             self.uninstaller = UninstallerService(
                 self.choco,
@@ -1995,29 +2016,7 @@ class UpdaterApp(ctk.CTk):
 
     @staticmethod
     def _scan_summary_text(rows: list[ReportEntry]) -> str:
-        n = len(rows)
-        upd = sum(1 for r in rows if "Update" in (r.status_after or ""))
-        miss = sum(1 for r in rows if (r.status_after or "") == "Nicht installiert")
-        err = sum(1 for r in rows if r.result == "Fehler" or "Fehler" in (r.status_after or ""))
-        cur = sum(
-            1
-            for r in rows
-            if (r.status_after or "") in ("Aktuell", "Installiert")
-            and "Update" not in (r.status_after or "")
-        )
-        manual = sum(
-            1 for r in rows if "Manuelle" in (r.status_after or "") or "manuelle" in (r.status_after or "").lower()
-        )
-        lines = [
-            f"Geprueft: {n} Programme",
-            f"- Update verfuegbar: {upd}",
-            f"- Nicht installiert: {miss}",
-            f"- Aktuell / installiert: {cur}",
-            f"- Fehler: {err}",
-        ]
-        if manual:
-            lines.append(f"- Manuelle Prüfung nötig: {manual}")
-        return "\n".join(lines)
+        return "\n".join(format_scan_summary_lines(rows))
 
     @staticmethod
     def _install_summary_message(
@@ -2026,80 +2025,8 @@ class UpdaterApp(ctk.CTk):
         mandatory: bool = False,
         operation: str = "install",
     ) -> str:
-        if dry_run:
-            sim = noop = source_required = err = removed = reboot_required = 0
-            for r in rows:
-                sa = r.status_after or ""
-                if sa == "Quelle erforderlich":
-                    source_required += 1
-                elif "entfernen" in (r.action or "").lower():
-                    removed += 1
-                elif (r.action or "") == "Keine Aktion erforderlich":
-                    noop += 1
-                elif r.result == "DRY-RUN":
-                    sim += 1
-                elif r.result == "Fehler":
-                    err += 1
-                else:
-                    noop += 1
-                if (r.reboot_required or "no").lower() == "yes":
-                    reboot_required += 1
-            return (
-                "Zusammenfassung (Dry-Run):\n"
-                f"- {sim} simulierte Aktionen\n"
-                f"- {removed} simulierte Entfernungen\n"
-                f"- {noop} ohne Änderung\n"
-                f"- {source_required} Quelle erforderlich\n"
-                f"- {err} Fehler\n"
-                f"- {reboot_required} Neustart erforderlich"
-            )
-        if operation == "remove" and not dry_run:
-            removed_ok = sum(
-                1
-                for r in rows
-                if r.result == "OK"
-                and "entfernen" in (r.action or "").lower()
-                and "manuelle" not in (r.action or "").lower()
-            )
-            absent = sum(1 for r in rows if (r.action or "") == "Keine Aktion erforderlich")
-            manual_req = sum(1 for r in rows if r.result == "Manuell" or "Manuelle" in (r.status_after or ""))
-            failed = sum(1 for r in rows if r.result == "Fehler")
-            reboot_required = sum(1 for r in rows if (r.reboot_required or "no").lower() == "yes")
-            return (
-                "Zusammenfassung (Entfernen):\n"
-                f"- {removed_ok} entfernt\n"
-                f"- {absent} bereits nicht installiert\n"
-                f"- {manual_req} manuelle Deinstallation nötig\n"
-                f"- {failed} fehlgeschlagen\n"
-                f"- {reboot_required} Neustart erforderlich\n"
-            )
-        n = len(rows)
-        err = sum(1 for r in rows if r.result == "Fehler")
-        installed = sum(1 for r in rows if r.result == "OK" and r.action in ("Install", "Interner Installer"))
-        upgraded = sum(1 for r in rows if r.result == "OK" and r.action == "Upgrade")
-        removed = sum(1 for r in rows if r.result == "OK" and "entfernen" in (r.action or "").lower())
-        source_required = sum(1 for r in rows if (r.status_after or "") == "Quelle erforderlich")
-        already_present = sum(1 for r in rows if r.action == "Keine Aktion erforderlich")
-        reboot_required = sum(1 for r in rows if (r.reboot_required or "no").lower() == "yes")
-        if mandatory:
-            return (
-                "Pflichtsoftware-Lauf abgeschlossen\n"
-                f"- installiert: {installed}\n"
-                f"- bereits vorhanden: {already_present}\n"
-                f"- aktualisiert: {upgraded}\n"
-                f"- Quelle erforderlich: {source_required}\n"
-                f"- Fehler: {err}\n"
-                f"- Neustart erforderlich: {reboot_required}\n"
-            )
-        return (
-            "Zusammenfassung:\n"
-            f"- {installed} installiert\n"
-            f"- {upgraded} aktualisiert\n"
-            f"- {removed} entfernt\n"
-            f"- {already_present} bereits vorhanden\n"
-            f"- {source_required} Quelle erforderlich\n"
-            f"- {err} Fehler\n"
-            f"- {reboot_required} Neustart erforderlich\n"
+        return "\n".join(
+            format_install_summary_lines(rows, dry_run=dry_run, mandatory=mandatory, operation=operation),
         )
 
     def _show_completion_dialog(self, data: dict) -> None:
@@ -2121,14 +2048,9 @@ class UpdaterApp(ctk.CTk):
         tb.pack(fill="both", expand=True)
         lines = [summary.strip(), "", "Details (Auszug):"]
         if isinstance(entries, list):
-            for r in entries[:120]:
-                if not isinstance(r, ReportEntry):
-                    continue
-                sw = SOFTWARE_BY_KEY.get(r.software_key)
-                nm = sw.display_name if sw else r.software_key
-                lines.append(f"- {nm}: {r.action} -> {r.result} ({r.status_after})")
-                if r.error_message:
-                    lines.append(f"    {r.error_message}")
+            re_list = [r for r in entries[:120] if isinstance(r, ReportEntry)]
+            for line in dialog_detail_lines(re_list, limit=len(re_list)):
+                lines.append(line)
         tb.insert("1.0", "\n".join(lines))
         tb.configure(state="disabled")
 
@@ -2340,8 +2262,8 @@ class UpdaterApp(ctk.CTk):
         def download_progress_callback(read: int, total: int | None) -> None:
             self.ui_queue.put(("download_progress", {"read": read, "total": total}))
 
-        def activity_callback(display_name: str, detail: str) -> None:
-            self.ui_queue.put(("install_activity", (display_name, detail)))
+        def activity_callback(display_name: str, detail: str, progress_phase: str | None = None) -> None:
+            self.ui_queue.put(("install_activity", (display_name, detail, progress_phase)))
 
         def item_start_callback(key: str) -> None:
             self.ui_queue.put(("row_progress_start", key))
@@ -2373,10 +2295,10 @@ class UpdaterApp(ctk.CTk):
                     else:
                         self.logger.info("FileZilla: Installation ohne Buchhaltungs-Markierung (manuell oder anderer Auswahlweg).")
                 if mode == "install" and InstallerService.is_reboot_pending():
-                    self.logger.warning("Reboot Pending erkannt: Neustart empfohlen/erforderlich.")
-                    self.ui_queue.put(("hint", "Neustart empfohlen/erforderlich"))
+                    self.logger.warning("Reboot Pending erkannt: Neustart empfohlen.")
+                    self.ui_queue.put(("hint", "Neustart empfohlen"))
                     if mandatory:
-                        self.ui_queue.put(("warning", "Neustart empfohlen/erforderlich. Pflichtlauf wird trotzdem fortgesetzt."))
+                        self.ui_queue.put(("warning", "Neustart empfohlen. Pflichtlauf wird trotzdem fortgesetzt."))
                 if mode in ("install", "remove"):
                     self._queue_status("Installationsstatus wird aktualisiert...")
                     fresh = self.scanner.scan()
@@ -2438,7 +2360,7 @@ class UpdaterApp(ctk.CTk):
                             self.ui_queue.put(("software_row", (rk, fresh_remove[rk])))
                 pending_after = any((r.reboot_required or "no").lower() == "yes" for r in rows)
                 if pending_after:
-                    self.ui_queue.put(("hint", "Neustart empfohlen/erforderlich"))
+                    self.ui_queue.put(("hint", "Neustart empfohlen"))
                 self.logger.info("Vorgang abgeschlossen.")
                 self._queue_status("OK - Vorgang abgeschlossen.")
                 summary = self._install_summary_message(rows, dry, mandatory=mandatory, operation=mode)
@@ -2674,9 +2596,13 @@ class UpdaterApp(ctk.CTk):
             if action == "status_line":
                 self._last_status_message = str(payload)
                 self._apply_status_line()
-            elif action == "install_activity" and isinstance(payload, tuple) and len(payload) == 2:
+            elif action == "install_activity" and isinstance(payload, tuple) and len(payload) >= 2:
                 dn, det = str(payload[0]), str(payload[1])
                 self._install_activity_line = f"{dn}: {det}" if dn else det
+                if len(payload) >= 3 and payload[2]:
+                    self._progress_phase = str(payload[2])
+                else:
+                    self._progress_phase = "bearbeitet"
                 self._apply_status_line()
                 self._refresh_progress_count_label()
             elif action == "download_progress" and isinstance(payload, dict):

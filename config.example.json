@@ -209,6 +209,12 @@
     "name": "chocolatey",
     "url": "https://community.chocolatey.org/api/v2/"
   },
+  "installer_behavior": {
+    "settle_wait_seconds": 60,
+    "verify_after_timeout": true,
+    "verify_poll_interval_seconds": 10,
+    "verify_poll_max_seconds": 180
+  },
   "local_source": {
     "last_path": "",
     "prefer_local": true

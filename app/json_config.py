@@ -9,7 +9,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .config import APP_DIR, BUNDLE_DIR, INTERNAL_INSTALLERS, SOFTWARE_CATALOG, SoftwarePackage
+from .config import (
+    APP_DIR,
+    BUNDLE_DIR,
+    INSTALLER_SETTLE_WAIT_SECONDS,
+    INSTALLER_VERIFY_AFTER_TIMEOUT,
+    INSTALLER_VERIFY_POLL_INTERVAL_SECONDS,
+    INSTALLER_VERIFY_POLL_MAX_SECONDS,
+    INTERNAL_INSTALLERS,
+    SOFTWARE_CATALOG,
+    SoftwarePackage,
+)
 
 CONFIG_JSON_PATH = APP_DIR / "config.json"
 CONFIG_EXAMPLE_PATH = APP_DIR / "config.example.json"
@@ -61,6 +71,12 @@ DEFAULT_EXAMPLE_CONFIG: dict[str, Any] = {
         "name": "chocolatey",
         "url": "https://community.chocolatey.org/api/v2/",
     },
+    "installer_behavior": {
+        "settle_wait_seconds": 60,
+        "verify_after_timeout": True,
+        "verify_poll_interval_seconds": 10,
+        "verify_poll_max_seconds": 180,
+    },
 }
 
 
@@ -84,6 +100,10 @@ class RuntimeSettings:
     software_providers: dict[str, Any]
     local_source_last_path: str
     local_source_prefer_local: bool
+    installer_settle_wait_seconds: int = INSTALLER_SETTLE_WAIT_SECONDS
+    installer_verify_after_timeout: bool = INSTALLER_VERIFY_AFTER_TIMEOUT
+    installer_verify_poll_interval_seconds: int = INSTALLER_VERIFY_POLL_INTERVAL_SECONDS
+    installer_verify_poll_max_seconds: int = INSTALLER_VERIFY_POLL_MAX_SECONDS
 
 
 def default_software_providers() -> dict[str, Any]:
@@ -231,6 +251,29 @@ def load_runtime_settings(logger: logging.Logger | None = None) -> RuntimeSettin
     local_source_last_path = str(local_source.get("last_path", "") or "").strip()
     local_source_prefer_local = bool(local_source.get("prefer_local", True))
 
+    settle_wait = INSTALLER_SETTLE_WAIT_SECONDS
+    verify_after_timeout = INSTALLER_VERIFY_AFTER_TIMEOUT
+    poll_interval = INSTALLER_VERIFY_POLL_INTERVAL_SECONDS
+    poll_max = INSTALLER_VERIFY_POLL_MAX_SECONDS
+    ib_raw: Any = data.get("installer_behavior")
+    if isinstance(ib_raw, dict):
+        try:
+            settle_wait = int(ib_raw.get("settle_wait_seconds", settle_wait))
+        except (TypeError, ValueError):
+            settle_wait = INSTALLER_SETTLE_WAIT_SECONDS
+        verify_after_timeout = bool(ib_raw.get("verify_after_timeout", verify_after_timeout))
+        try:
+            poll_interval = int(ib_raw.get("verify_poll_interval_seconds", poll_interval))
+        except (TypeError, ValueError):
+            poll_interval = INSTALLER_VERIFY_POLL_INTERVAL_SECONDS
+        try:
+            poll_max = int(ib_raw.get("verify_poll_max_seconds", poll_max))
+        except (TypeError, ValueError):
+            poll_max = INSTALLER_VERIFY_POLL_MAX_SECONDS
+    settle_wait = max(0, min(settle_wait, 600))
+    poll_interval = max(1, min(poll_interval, 120))
+    poll_max = max(0, min(poll_max, 3600))
+
     merged_installers = _merge_internal_installers(internal_overrides)
     enabled = _parse_enabled_keys(enabled_raw)
     choco_source = _parse_chocolatey_source(choco_src_raw)
@@ -280,6 +323,10 @@ def load_runtime_settings(logger: logging.Logger | None = None) -> RuntimeSettin
         software_providers=software_providers,
         local_source_last_path=local_source_last_path,
         local_source_prefer_local=local_source_prefer_local,
+        installer_settle_wait_seconds=settle_wait,
+        installer_verify_after_timeout=verify_after_timeout,
+        installer_verify_poll_interval_seconds=poll_interval,
+        installer_verify_poll_max_seconds=poll_max,
     )
 
 

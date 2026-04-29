@@ -38,6 +38,12 @@ REPORT_DIR = LOG_DIR / "reports"
 COMMAND_TIMEOUT_SECONDS = 180
 INSTALL_TIMEOUT_SECONDS = 1800
 
+# Nach Choco/WinGet-Timeout: warten bis Kind-Installer enden, dann Scanner-Verifikation (siehe installer_behavior in config.json).
+INSTALLER_SETTLE_WAIT_SECONDS = 60
+INSTALLER_VERIFY_AFTER_TIMEOUT = True
+INSTALLER_VERIFY_POLL_INTERVAL_SECONDS = 10
+INSTALLER_VERIFY_POLL_MAX_SECONDS = 180
+
 AVAYA_INSTALLER_SOURCE = r"\\fileserver\software\Avaya\AvayaWorkplaceSetup.exe"
 OPENTEXT_INSTALLER_SOURCE = r"\\fileserver\software\OpenText\OpenTextSetup.exe"
 # OpenText Core Endpoint Protection (Webroot): generischer Agent-Download; Site-Keycode = Dateiname laut Hersteller.
@@ -72,6 +78,7 @@ SOFTWARE_ALIASES: dict[str, tuple[str, ...]] = {
     "adobe_reader": ("adobe", "acrobat", "reader", "acrobat reader"),
     "teamviewer": ("teamviewer", "team viewer"),
     "microsoft_teams": ("microsoft teams", "ms teams", "teams machine-wide", "teams work or school"),
+    "teamspeak": ("teamspeak", "team speak"),
     "office365business": ("microsoft 365", "office", "office365", "m365", "o365"),
     "opentext": ("opentext", "open text", "opentext content"),
     "opentext_core_endpoint": (
@@ -132,6 +139,14 @@ SOFTWARE_CATALOG: tuple[SoftwarePackage, ...] = (
         winget_id="Microsoft.Teams",
         search_terms=("microsoft teams", "teams"),
         registry_keywords=("teams", "microsoft teams"),
+    ),
+    SoftwarePackage(
+        key="teamspeak",
+        display_name="TeamSpeak",
+        primary_package=None,
+        winget_id=None,
+        search_terms=("teamspeak", "team speak"),
+        registry_keywords=("teamspeak",),
     ),
     SoftwarePackage(
         key="office365business",
