@@ -21,7 +21,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Build fehlgeschlagen: PyInstaller ExitCode $LASTEXITCODE"
 }
 
-$distExe = Join-Path $projectRoot "dist\GBB_SoftwareUpdater.exe"
+$distExe = Join-Path $projectRoot "dist\GBB Updater.exe"
 if (-not (Test-Path $distExe)) {
     throw "Build fehlgeschlagen: $distExe nicht gefunden."
 }

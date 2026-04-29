@@ -98,7 +98,7 @@ class UpdaterApp(ctk.CTk):
         self.settings_btn: ctk.CTkButton | None = None
         self._progress_phase = ""
         self._last_status_message = "Bereit"
-        self._download_progress_caption = ""
+        self._download_progress_suffix = ""
         self._filezilla_buchhaltung: bool | None = None
         self._install_activity_line = ""
         self._active_item_display = ""
@@ -664,7 +664,7 @@ class UpdaterApp(ctk.CTk):
         self.progress = ctk.CTkProgressBar(bottom_frame)
         self.progress.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 2))
         self.progress.set(0)
-        self.progress_count_label = ctk.CTkLabel(bottom_frame, text="0/0", width=120, anchor="e", font=ctk.CTkFont(size=10))
+        self.progress_count_label = ctk.CTkLabel(bottom_frame, text="0/0", width=220, anchor="e", font=ctk.CTkFont(size=10))
         self.progress_count_label.grid(row=0, column=1, sticky="e", padx=6, pady=(4, 2))
 
         self.status_line = ctk.CTkLabel(bottom_frame, text="Bereit", font=ctk.CTkFont(size=10))
@@ -2387,10 +2387,20 @@ class UpdaterApp(ctk.CTk):
         act = (self._install_activity_line or "").strip()
         if act:
             parts.append(act)
-        dl = (self._download_progress_caption or "").strip()
-        if dl:
-            parts.append(dl)
         self.status_line.configure(text=" · ".join(parts))
+
+    def _refresh_progress_count_label(self) -> None:
+        done, total = self._last_prog_done, self._last_prog_total
+        phase = self._progress_phase or "bearbeitet"
+        cur = (self._active_item_display or "").strip()
+        dl = (self._download_progress_suffix or "").strip()
+        if cur:
+            text = f"{done}/{total} · {cur} · {phase}"
+        else:
+            text = f"{done}/{total} Programme {phase}"
+        if dl:
+            text = f"{text} · {dl}"
+        self.progress_count_label.configure(text=text)
 
     def _queue_status(self, text: str) -> None:
         self.ui_queue.put(("status_line", text))
@@ -2421,18 +2431,11 @@ class UpdaterApp(ctk.CTk):
                 dn, det = str(payload[0]), str(payload[1])
                 self._install_activity_line = f"{dn}: {det}" if dn else det
                 self._apply_status_line()
-                d, t = self._last_prog_done, self._last_prog_total
-                if t > 0 or d > 0:
-                    phase = self._progress_phase or "bearbeitet"
-                    cur = (self._active_item_display or "").strip()
-                    if cur:
-                        self.progress_count_label.configure(text=f"{d}/{t} · {cur} · {phase}")
-                    else:
-                        self.progress_count_label.configure(text=f"{d}/{t} Programme {phase}")
+                self._refresh_progress_count_label()
             elif action == "download_progress" and isinstance(payload, dict):
                 read = int(payload.get("read", 0))
                 if read < 0:
-                    self._download_progress_caption = ""
+                    self._download_progress_suffix = ""
                 else:
                     raw_total = payload.get("total")
                     total_bytes: int | None
@@ -2445,11 +2448,11 @@ class UpdaterApp(ctk.CTk):
                             total_bytes = None
                     if total_bytes is not None and total_bytes > 0:
                         rem = max(0.0, (total_bytes - read) / (1024 * 1024))
-                        self._download_progress_caption = f"Download: {rem:.1f} MB verbleibend"
+                        self._download_progress_suffix = f"noch ca. {rem:.1f} MB"
                     else:
                         loaded = read / (1024 * 1024)
-                        self._download_progress_caption = f"Download: {loaded:.1f} MB geladen (Groesse unbekannt)"
-                self._apply_status_line()
+                        self._download_progress_suffix = f"{loaded:.1f} MB"
+                self._refresh_progress_count_label()
             elif action == "software_row":
                 key, state = payload  # type: ignore[misc]
                 self._apply_row_state(str(key), state)
@@ -2458,15 +2461,18 @@ class UpdaterApp(ctk.CTk):
                 keys = payload if isinstance(payload, list) else []
                 self._active_item_display = ""
                 self._install_activity_line = ""
+                self._download_progress_suffix = ""
                 self._apply_status_line()
+                self._refresh_progress_count_label()
                 for key in keys:
                     self._set_row_progress_reset(str(key))
             elif action == "row_progress_start":
-                self._download_progress_caption = ""
+                self._download_progress_suffix = ""
                 k = str(payload)
                 pkg = SOFTWARE_BY_KEY.get(k)
                 self._active_item_display = pkg.display_name if pkg else k
                 self._apply_status_line()
+                self._refresh_progress_count_label()
                 self._set_row_progress_start(k)
             elif action == "resolved_source" and isinstance(payload, dict):
                 update_provider_resolved_source(
@@ -2477,7 +2483,7 @@ class UpdaterApp(ctk.CTk):
                 )
             elif action == "progress":
                 if isinstance(payload, dict):
-                    self._download_progress_caption = ""
+                    self._download_progress_suffix = ""
                     self._apply_status_line()
                     frac = float(payload.get("frac", 0.0))
                     done = int(payload.get("done", 0))
@@ -2485,12 +2491,7 @@ class UpdaterApp(ctk.CTk):
                     self._last_prog_done = done
                     self._last_prog_total = total
                     self.progress.set(frac)
-                    phase = self._progress_phase or "bearbeitet"
-                    cur = (self._active_item_display or "").strip()
-                    if cur:
-                        self.progress_count_label.configure(text=f"{done}/{total} · {cur} · {phase}")
-                    else:
-                        self.progress_count_label.configure(text=f"{done}/{total} Programme {phase}")
+                    self._refresh_progress_count_label()
                 else:
                     self.progress.set(float(payload))
             elif action == "warning":
@@ -2540,7 +2541,9 @@ class UpdaterApp(ctk.CTk):
                 if bool(payload):
                     self._install_activity_line = ""
                     self._active_item_display = ""
+                    self._download_progress_suffix = ""
                     self._apply_status_line()
+                    self._refresh_progress_count_label()
                 self._set_actions_enabled(bool(payload))
             elif action == "hint":
                 self.hint_line.configure(text=str(payload))

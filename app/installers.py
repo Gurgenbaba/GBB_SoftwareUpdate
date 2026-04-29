@@ -155,7 +155,7 @@ class InstallerService:
                 progress_callback(index - 1, total)
                 if item_start_callback is not None:
                     item_start_callback(key)
-                self._emit_activity(software, "Installation / Provider wird ausgefuehrt …")
+                self._emit_activity(software, "Installation …")
                 self.logger.info("%s wird verarbeitet...", software.display_name)
                 previous_state = current_states.get(key, SoftwareState("Nicht geprueft"))
 
@@ -693,7 +693,7 @@ class InstallerService:
             return ("DRY-RUN: wuerde upgraden", SoftwareState("Dry-Run (unveraendert)", package_name=package_name, provider="Chocolatey"))
         sw = self.software_by_key.get(self._current_software_key)
         if sw:
-            self._emit_activity(sw, "Chocolatey (Upgrade) — ggf. sichtbares Setup …")
+            self._emit_activity(sw, "Chocolatey (Upgrade) …")
         native = bool(getattr(self, "_native_vendor_install_ui", False))
         result = self._run_with_retry(package_name, "upgrade", package_name, native_ui=native)
         return ("Upgrade", SoftwareState("Aktuell" if result.ok else "Fehler", package_name=package_name, detail=self._combine_error(result), provider="Chocolatey"))
@@ -707,7 +707,7 @@ class InstallerService:
                 return ("Upgrade", SoftwareState("Fehler", package_name=winget_id, detail=self._combine_error(bootstrap_result), provider="WinGet"))
         sw = self.software_by_key.get(self._current_software_key)
         if sw:
-            self._emit_activity(sw, "WinGet (Upgrade) — interaktives Setup …")
+            self._emit_activity(sw, "WinGet (Upgrade) …")
         interactive = bool(getattr(self, "_native_vendor_install_ui", False))
         result = self._run_winget_with_lock_retry("upgrade", winget_id, interactive=interactive)
         return ("Upgrade", SoftwareState("Aktuell" if result.ok else "Fehler", package_name=winget_id, detail=self._combine_error(result), provider="WinGet"))
@@ -717,7 +717,7 @@ class InstallerService:
             return ("DRY-RUN: wuerde installieren", SoftwareState("Dry-Run (unveraendert)", package_name=package_name, provider="Chocolatey"))
         sw = self.software_by_key.get(self._current_software_key)
         if sw:
-            self._emit_activity(sw, "Chocolatey — ggf. sichtbares Setup (Adobe etc.) …")
+            self._emit_activity(sw, "Chocolatey …")
         native = bool(getattr(self, "_native_vendor_install_ui", False))
         result = self._run_with_retry(package_name, "install", package_name, native_ui=native)
         return ("Install", SoftwareState("Installiert" if result.ok else "Fehler", package_name=package_name, detail=self._combine_error(result), provider="Chocolatey"))
@@ -731,7 +731,7 @@ class InstallerService:
                 return ("Install", SoftwareState("Fehler", package_name=winget_id, detail=self._combine_error(bootstrap_result), provider="WinGet"))
         sw = self.software_by_key.get(self._current_software_key)
         if sw:
-            self._emit_activity(sw, "WinGet — interaktives Setup …")
+            self._emit_activity(sw, "WinGet …")
         interactive = bool(getattr(self, "_native_vendor_install_ui", False))
         result = self._run_winget_with_lock_retry("install", winget_id, interactive=interactive)
         return ("Install", SoftwareState("Installiert" if result.ok else "Fehler", package_name=winget_id, detail=self._combine_error(result), provider="WinGet"))
@@ -813,11 +813,11 @@ class InstallerService:
         if prefetched and os.path.isfile(prefetched):
             cmd_source = prefetched
             downloaded_file = prefetched
-            self._emit_activity(software, "Vorbereiteter Firmen-Download — starte Setup …")
+            self._emit_activity(software, "Setup (vorbereitet) …")
             self.logger.info("%s Installer (vorbereitet): %s", software.display_name, source_text)
         elif is_url_source and not dry_run:
             try:
-                self._emit_activity(software, "Download des firmeninternen Installers …")
+                self._emit_activity(software, "Installer laden …")
                 downloaded_file = self._download_installer_from_url(source_text, report_progress=True)
                 cmd_source = downloaded_file
                 self.logger.info("%s Installer aus URL geladen: %s", software.display_name, source_text)
@@ -846,7 +846,7 @@ class InstallerService:
             self.logger.info("%s Installation gestartet...", software.display_name)
         self.logger.info("%s aus Firmenquelle installiert: %s", software.display_name, source_text)
         self.logger.info("EXEC: %s", " ".join(cmd))
-        self._emit_activity(software, "Setup-Fenster / Installation …")
+        self._emit_activity(software, "Setup …")
         try:
             hide_win = self._hide_for_internal_subprocess(is_msi, bool(getattr(self, "_native_vendor_install_ui", False)))
             completed = self._run_subprocess_with_lock_retry(cmd, hide_window=hide_win)

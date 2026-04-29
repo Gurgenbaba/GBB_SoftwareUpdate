@@ -55,7 +55,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="GBB_SoftwareUpdater",
+    name="GBB Updater",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
