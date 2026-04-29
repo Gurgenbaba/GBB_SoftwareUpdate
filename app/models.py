@@ -35,3 +35,6 @@ class ReportEntry:
     verification_status: str = ""
     verification_evidence: str = ""
     stale_evidence_ignored: str = ""
+    cleanup_items_found: str = ""
+    cleanup_items_removed: str = ""
+    cleanup_classification: str = ""

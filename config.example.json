@@ -51,7 +51,20 @@
         "uninstall_silent_args": [],
         "vendor_uninstall": { "type": "", "path": "", "args": [] }
       },
-      "search_terms": ["citrix workspace", "citrix"]
+      "search_terms": ["citrix workspace", "citrix"],
+      "cleanup": {
+        "paths": [
+          "{PROGRAMFILES(X86)}\\Citrix\\**",
+          "{PROGRAMFILES}\\Citrix\\**",
+          "{PROGRAMDATA}\\Citrix\\**",
+          "{LOCALAPPDATA}\\Citrix\\**"
+        ],
+        "registry": [
+          {"hive": "HKCU", "key": "SOFTWARE\\Citrix\\PnAgent"},
+          {"hive": "HKLM", "key": "SOFTWARE\\WOW6432Node\\Citrix\\Installer"}
+        ],
+        "shortcuts": ["Citrix", "Workspace", "Receiver"]
+      }
     },
     "adobe_reader": {
       "enabled": true,
@@ -93,7 +106,16 @@
         "uninstall_silent_args": [],
         "vendor_uninstall": { "type": "", "path": "", "args": [] }
       },
-      "search_terms": ["microsoft teams", "teams"]
+      "search_terms": ["microsoft teams", "teams"],
+      "cleanup": {
+        "paths": [
+          "{LOCALAPPDATA}\\Microsoft\\Teams\\**",
+          "{APPDATA}\\Microsoft\\Teams\\**",
+          "{PROGRAMDATA}\\Microsoft\\Teams\\**"
+        ],
+        "registry": [],
+        "shortcuts": ["Teams", "Microsoft Teams", "MSTeams"]
+      }
     },
     "office365business": {
       "enabled": true,
@@ -113,7 +135,16 @@
         "uninstall_silent_args": [],
         "vendor_uninstall": { "type": "", "path": "", "args": [] }
       },
-      "search_terms": ["office 365 business", "m365", "microsoft 365"]
+      "search_terms": ["office 365 business", "m365", "microsoft 365"],
+      "cleanup": {
+        "paths": [
+          "{PROGRAMDATA}\\Microsoft\\Office\\**",
+          "{LOCALAPPDATA}\\Microsoft\\Office\\**",
+          "{APPDATA}\\Microsoft\\Office\\**"
+        ],
+        "registry": [],
+        "shortcuts": ["Microsoft 365", "Microsoft Office", "Word 20", "Excel 20", "Outlook"]
+      }
     },
     "opentext": {
       "enabled": true,

@@ -99,6 +99,9 @@ class ReportWriter:
                     "verification_status",
                     "verification_evidence",
                     "stale_evidence_ignored",
+                    "cleanup_items_found",
+                    "cleanup_items_removed",
+                    "cleanup_classification",
                 ]
             )
             for item in entries:
@@ -125,6 +128,9 @@ class ReportWriter:
                         getattr(item, "verification_status", "") or "",
                         getattr(item, "verification_evidence", "") or "",
                         getattr(item, "stale_evidence_ignored", "") or "",
+                        getattr(item, "cleanup_items_found", "") or "",
+                        getattr(item, "cleanup_items_removed", "") or "",
+                        getattr(item, "cleanup_classification", "") or "",
                     ]
                 )
         self.logger.info("CSV-Report gespeichert: %s", report_path)

@@ -104,6 +104,9 @@ class UninstallerService:
                     verification_status=getattr(eng, "verification_status", "") or "",
                     verification_evidence=getattr(eng, "verification_evidence", "") or "",
                     stale_evidence_ignored=getattr(eng, "stale_evidence_ignored", "") or "",
+                    cleanup_items_found="",
+                    cleanup_items_removed="",
+                    cleanup_classification="",
                 )
             )
         return rows

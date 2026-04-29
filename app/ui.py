@@ -33,6 +33,7 @@ from .json_config import (
 from .logger import build_logger
 from .models import ReportEntry, SoftwareState
 from .reporting import ReportWriter, pdf_export_available, write_summary_pdf
+from .residue_cleanup import apply_selected_cleanup, run_residue_cleanup_phase
 from .scanner import SoftwareScanner
 from .system_tools import SystemActionResult, SystemToolsService
 
@@ -2169,6 +2170,128 @@ class UpdaterApp(ctk.CTk):
         if not pdf_export_available():
             pdf_btn.configure(state="disabled")
 
+    def _run_residue_cleanup_dialog_payload(self, payload: dict) -> None:
+        """Main-thread dialog: scan results with optional deletion (TuneUp-style)."""
+        rq = payload.get("response_q")
+        cr = payload.get("cleanup")
+        title_name = str(payload.get("display_name", "Software"))
+        if rq is None or cr is None:
+            return
+
+        total_found = len(cr.paths_found) + len(cr.registry_keys_found) + len(cr.shortcuts_found)
+        if total_found > 0 and len(cr.removable_items) == 0:
+            msg = (
+                f"Es wurden {total_found} Restobjekt(e) gefunden, aber keine liegen unter den "
+                "erlaubten Standardpfaden (Program Files, ProgramData, AppData …).\n\n"
+                "Bitte manuell im Explorer oder in der Registrierung prüfen."
+            )
+            if cr.skipped_items:
+                msg += "\n\nNicht als sicher löschbar eingestuft:\n"
+                msg += "\n".join(f"- {(s.label or s.target)[:100]}" for s in cr.skipped_items[:12])
+                if len(cr.skipped_items) > 12:
+                    msg += "\n…"
+            messagebox.showinfo(APP_NAME, msg, parent=self)
+            rq.put({"cancelled": False, "removed_ok": 0, "failed": 0, "selected_count": 0, "info_only": True})
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Reste gefunden")
+        dialog.geometry("700x520")
+        dialog.transient(self)
+        dialog.grab_set()
+        fg = self.ogx_colors.get("panel", "#171b22")
+        dialog.configure(fg_color=self.ogx_colors.get("bg", "#0f1115"))
+
+        head = ctk.CTkLabel(
+            dialog,
+            text=f"{title_name}: {total_found} Restobjekt(e). Wählen Sie Einträge zum Löschen.",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=self.ogx_colors.get("text", "#e6edf7"),
+        )
+        head.pack(anchor="w", padx=14, pady=(12, 4))
+
+        scroll = ctk.CTkScrollableFrame(dialog, fg_color=fg, height=300)
+        scroll.pack(fill="both", expand=True, padx=12, pady=8)
+
+        vars_by_id: dict[str, ctk.BooleanVar] = {}
+        for it in cr.removable_items:
+            v = ctk.BooleanVar(value=True)
+            vars_by_id[it.id] = v
+            row_f = ctk.CTkFrame(scroll, fg_color="transparent")
+            row_f.pack(fill="x", pady=1)
+            ctk.CTkCheckBox(row_f, text="", variable=v, width=28).pack(side="left", padx=(0, 4))
+            lbl = f"[{it.kind}] {(it.label or it.target)[:95]}"
+            ctk.CTkLabel(row_f, text=lbl, anchor="w", font=ctk.CTkFont(size=12)).pack(side="left", fill="x", expand=True)
+
+        if cr.skipped_items:
+            ctk.CTkLabel(
+                scroll,
+                text="Nicht automatisch löschbar (Auszug):",
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=self.ogx_colors.get("muted", "#a4b0c0"),
+            ).pack(anchor="w", pady=(8, 2))
+            for s in cr.skipped_items[:20]:
+                ctk.CTkLabel(
+                    scroll,
+                    text=f"- {(s.label or s.target)[:100]} — {s.skip_reason or 'unsicher'}",
+                    anchor="w",
+                    font=ctk.CTkFont(size=11),
+                    text_color=self.ogx_colors.get("muted", "#a4b0c0"),
+                ).pack(anchor="w")
+
+        btn_bar = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_bar.pack(fill="x", padx=12, pady=(4, 12))
+
+        def select_all_fn() -> None:
+            for v in vars_by_id.values():
+                v.set(True)
+
+        def select_none_fn() -> None:
+            for v in vars_by_id.values():
+                v.set(False)
+
+        def finish(cancelled: bool, removed_ok: int = 0, failed: int = 0, selected_count: int = 0) -> None:
+            try:
+                dialog.grab_release()
+            except Exception:  # pragma: no cover
+                pass
+            dialog.destroy()
+            rq.put(
+                {
+                    "cancelled": cancelled,
+                    "removed_ok": removed_ok,
+                    "failed": failed,
+                    "selected_count": selected_count,
+                    "info_only": False,
+                }
+            )
+
+        def on_clean() -> None:
+            selected = [it for it in cr.removable_items if vars_by_id.get(it.id) and vars_by_id[it.id].get()]
+            if not selected:
+                messagebox.showwarning(APP_NAME, "Bitte mindestens ein Objekt auswählen.", parent=dialog)
+                return
+            if not messagebox.askyesno(
+                APP_NAME,
+                f"Ausgewählte {len(selected)} Objekt(e) unwiderruflich löschen?",
+                parent=dialog,
+            ):
+                return
+            rok, fl = apply_selected_cleanup(selected, self.logger)
+            finish(cancelled=False, removed_ok=rok, failed=fl, selected_count=len(selected))
+
+        ctk.CTkButton(btn_bar, text="Alle auswählen", command=select_all_fn, width=120).pack(side="left", padx=2)
+        ctk.CTkButton(btn_bar, text="Keine", command=select_none_fn, width=80).pack(side="left", padx=2)
+        ctk.CTkButton(btn_bar, text="Ausgewählte bereinigen", command=on_clean, fg_color=self.ogx_colors.get("accent", "#4c6ef5")).pack(
+            side="left", padx=12
+        )
+        ctk.CTkButton(btn_bar, text="Schliessen (ohne Löschen)", command=lambda: finish(cancelled=True)).pack(side="right", padx=2)
+
+        def on_x() -> None:
+            finish(cancelled=True)
+
+        dialog.protocol("WM_DELETE_WINDOW", on_x)
+
     def _install_selected(self) -> None:
         self._run_action("install")
 
@@ -2297,6 +2420,14 @@ class UpdaterApp(ctk.CTk):
                         method_progress_callback=method_progress_callback,
                     )
                 )
+                if mode == "remove" and not dry:
+                    rows = run_residue_cleanup_phase(
+                        rows,
+                        self.runtime.software_providers,
+                        lambda k: SOFTWARE_BY_KEY[k].display_name if k in SOFTWARE_BY_KEY else k,
+                        self.logger,
+                        self.ui_queue,
+                    )
                 self.last_report_file = self.report_writer.write_report(rows, "install_report")
                 if mode == "remove" and not dry:
                     self._queue_status("Installationsstatus wird aktualisiert...")
@@ -2632,6 +2763,8 @@ class UpdaterApp(ctk.CTk):
                         self.logger.info("Info (Dialog fehlgeschlagen): %s", m)
 
                 self.after(0, _show_info)
+            elif action == "residue_cleanup_dialog" and isinstance(payload, dict):
+                self._run_residue_cleanup_dialog_payload(payload)
             elif action == "summary_dialog" and isinstance(payload, dict):
                 self._show_completion_dialog(payload)
             elif action == "energy_screensaver_done" and isinstance(payload, SystemActionResult):
