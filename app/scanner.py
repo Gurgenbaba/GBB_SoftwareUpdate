@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+import shlex
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
@@ -9,6 +13,16 @@ except ImportError:  # pragma: no cover - Windows only
 
 from .config import SOFTWARE_ALIASES, SOFTWARE_CATALOG, SoftwarePackage
 from .models import SoftwareState
+
+
+@dataclass(frozen=True)
+class PostUninstallVerification:
+    """Authoritative post-uninstall presence check (stricter than raw scan())."""
+
+    still_present: bool
+    verification_status: str
+    evidence: str
+    stale_evidence_ignored: str
 
 
 class SoftwareScanner:
@@ -99,28 +113,353 @@ class SoftwareScanner:
         return None
 
     @staticmethod
-    def _registry_match(software: SoftwarePackage, registry_entries: list[dict[str, str]]) -> bool:
+    def _registry_display_matches(software: SoftwarePackage, display_name: str) -> bool:
+        lowered = str(display_name or "").lower()
+        if not lowered:
+            return False
         keywords = tuple(word.lower() for word in software.registry_keywords)
         aliases = tuple(word.lower() for word in SOFTWARE_ALIASES.get(software.key, ()))
-        for entry in registry_entries:
-            lowered = str(entry.get("display_name", "")).lower()
-            if not lowered:
-                continue
-            if any(k in lowered for k in keywords) or any(a in lowered for a in aliases):
-                uninstall = str(entry.get("uninstall_string", "")).strip()
-                quiet_uninstall = str(entry.get("quiet_uninstall_string", "")).strip()
-                install_location = str(entry.get("install_location", "")).strip()
-                display_icon = str(entry.get("display_icon", "")).strip()
-                if uninstall or quiet_uninstall:
+        return any(k in lowered for k in keywords) or any(a in lowered for a in aliases)
+
+    @staticmethod
+    def registry_entry_signals_real_install(entry: dict[str, str]) -> bool:
+        """True only if uninstall path, install dir, or icon path is actionable and exists on disk (or msiexec)."""
+
+        def _uninstall_cmd_actionable(raw: str) -> bool:
+            raw = (raw or "").strip()
+            if not raw:
+                return False
+            try:
+                parts = shlex.split(raw, posix=False)
+            except ValueError:
+                parts = [p for p in raw.split() if p]
+            if not parts:
+                return False
+            exe0 = os.path.expandvars(parts[0].strip('"'))
+            name = Path(exe0).name.lower()
+            if name in ("msiexec.exe", "msiexec"):
+                return True
+            if name in ("rundll32.exe", "rundll32"):
+                return Path(exe0).is_file()
+            if not name.endswith(".exe"):
+                return False
+            try:
+                return Path(exe0).is_file()
+            except OSError:
+                return False
+
+        for raw in (entry.get("uninstall_string") or "", entry.get("quiet_uninstall_string") or ""):
+            if _uninstall_cmd_actionable(raw):
+                return True
+        loc = os.path.expandvars(str(entry.get("install_location") or "").strip())
+        if loc:
+            try:
+                if Path(loc).exists():
                     return True
-                if install_location and Path(install_location).exists():
-                    return True
-                if display_icon:
-                    icon_path = display_icon.split(",")[0].strip().strip('"')
-                    if icon_path and Path(icon_path).exists():
+            except OSError:
+                pass
+        di = str(entry.get("display_icon") or "").strip()
+        if di:
+            ip = os.path.expandvars(di.split(",")[0].strip().strip('"'))
+            if ip:
+                try:
+                    if Path(ip).exists():
                         return True
-                # Reine Registry-Leichen ohne validen Hinweis nicht als installiert werten.
+                except OSError:
+                    pass
         return False
+
+    @staticmethod
+    def _registry_match(software: SoftwarePackage, registry_entries: list[dict[str, str]]) -> bool:
+        for entry in registry_entries:
+            if not SoftwareScanner._registry_display_matches(software, entry.get("display_name", "")):
+                continue
+            if SoftwareScanner.registry_entry_signals_real_install(entry):
+                return True
+        return False
+
+    def post_uninstall_verify(self, software: SoftwarePackage) -> PostUninstallVerification:
+        """Re-evaluate installation after uninstall using stricter evidence than scan() alone."""
+        local = self.choco.list_local()
+        winget_installed = self.winget.list_installed() if self.winget.is_available() else {}
+        registry_entries = self._read_registry_program_entries()
+
+        stale: list[str] = []
+        evidence: list[str] = []
+
+        choco_pkg = self._detect_package_name(software, local)
+        wg_hit = bool(software.winget_id and software.winget_id.lower() in winget_installed)
+        if wg_hit:
+            evidence.append(f"WinGet inventory: {software.winget_id}")
+
+        reg_real = [e for e in registry_entries if self._registry_display_matches(software, e.get("display_name", "")) and self.registry_entry_signals_real_install(e)]
+        for e in reg_real[:3]:
+            evidence.append(f"ARP/Registry (valid): {e.get('display_name', '')[:80]}")
+
+        if software.key == "citrix_workspace":
+            phys = self._citrix_workspace_physical_present()
+            procs = self._citrix_related_processes_running()
+            if choco_pkg and not phys:
+                stale.append(f"Chocolatey lists '{choco_pkg}' but no Citrix Workspace/ICA binaries under Program Files")
+            if choco_pkg and phys:
+                evidence.append(f"Chocolatey + binaries: {choco_pkg}")
+            elif choco_pkg and not phys:
+                pass
+            if procs:
+                evidence.append(f"Citrix-related processes still running: {', '.join(procs)}")
+            still = bool(phys or wg_hit or reg_real or procs)
+            if not still and choco_pkg:
+                stale.append(f"Ignored Chocolatey-only entry '{choco_pkg}' (no binaries, no WinGet, no valid ARP)")
+            status = "absent" if not still else "present"
+            return PostUninstallVerification(still, status, " | ".join(evidence)[:500], " | ".join(stale)[:500])
+
+        if software.key == "microsoft_teams":
+            classic = self._teams_classic_install_present()
+            mwi = self._teams_machine_wide_install_present(registry_entries)
+            appx = self._teams_appx_or_msix_present()
+            if classic:
+                evidence.append("Teams classic (per-user Update.exe or Teams.exe)")
+            if mwi:
+                evidence.append("Teams machine-wide installer (ARP)")
+            if appx:
+                evidence.append("Teams AppX/MSIX package still registered")
+            if choco_pkg and not (classic or mwi or appx or wg_hit or reg_real):
+                stale.append(f"Chocolatey lists '{choco_pkg}' but no classic/MWI/AppX/WinGet/valid ARP evidence")
+            still = bool(classic or mwi or appx or wg_hit or reg_real)
+            if not still and choco_pkg:
+                stale.append(f"Ignored Chocolatey-only '{choco_pkg}'")
+            status = "absent" if not still else "present"
+            return PostUninstallVerification(still, status, " | ".join(evidence)[:500], " | ".join(stale)[:500])
+
+        if software.key == "office365business":
+            office_phys, office_msg = self._office365_physical_evidence()
+            if office_phys:
+                evidence.extend(office_msg)
+            c2r_reg, access_denied, c2r_msg = self._office365_click_to_run_registry()
+            if c2r_msg:
+                evidence.extend(c2r_msg)
+            if access_denied and not office_phys:
+                return PostUninstallVerification(
+                    True,
+                    "access_denied",
+                    " | ".join(evidence + ["Office Click-to-Run registry not readable (Zugriff verweigert)"])[:500],
+                    " | ".join(stale)[:500],
+                )
+            if choco_pkg and not (office_phys or wg_hit or reg_real):
+                stale.append(f"Chocolatey lists '{choco_pkg}' but no Office binaries/Click-to-Run/valid ARP")
+            still = bool(office_phys or wg_hit or reg_real or c2r_reg)
+            if not still and choco_pkg:
+                stale.append(f"Ignored Chocolatey-only '{choco_pkg}'")
+            status = "absent" if not still else "present"
+            return PostUninstallVerification(still, status, " | ".join(evidence)[:500], " | ".join(stale)[:500])
+
+        if choco_pkg:
+            evidence.append(f"Chocolatey: {choco_pkg}")
+        still = bool(choco_pkg or wg_hit or reg_real)
+        status = "absent" if not still else "present"
+        return PostUninstallVerification(still, status, " | ".join(evidence)[:500], " | ".join(stale)[:500])
+
+    @staticmethod
+    def _citrix_workspace_physical_present() -> bool:
+        roots = [
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Citrix",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Citrix",
+        ]
+        markers = ("TrolleyExpress.exe", "CitrixWorkspaceApp.exe", "WFICA32.exe", "SelfServicePlugin.exe")
+        for root in roots:
+            if not root.is_dir():
+                continue
+            try:
+                for sub in sorted(root.glob("Citrix Workspace*"), key=lambda p: str(p), reverse=True):
+                    if sub.is_dir():
+                        for m in markers:
+                            try:
+                                hit = next(sub.rglob(m), None)
+                                if hit and hit.is_file():
+                                    return True
+                            except OSError:
+                                continue
+            except OSError:
+                pass
+            for sub_name in ("ICA Client", "Receiver", "Workspace"):
+                p = root / sub_name
+                if p.is_dir():
+                    for m in markers:
+                        try:
+                            hit = next(p.rglob(m), None)
+                            if hit and hit.is_file():
+                                return True
+                        except OSError:
+                            continue
+            for m in markers:
+                try:
+                    for hit in root.rglob(m):
+                        if hit.is_file():
+                            return True
+                except OSError:
+                    continue
+        return False
+
+    @staticmethod
+    def _citrix_related_processes_running() -> list[str]:
+        names = ("SelfService.exe", "wfica32.exe", "concentr.exe", "redirector.exe", "CitrixWorkspaceApp.exe")
+        found: list[str] = []
+        try:
+            cp = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=45,
+                check=False,
+                shell=False,
+            )
+            blob = (cp.stdout or "").lower()
+            for n in names:
+                if n.lower() in blob:
+                    found.append(n)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return found
+
+    @staticmethod
+    def _teams_classic_install_present() -> bool:
+        la = os.environ.get("LOCALAPPDATA", "")
+        if not la:
+            return False
+        base = Path(la) / "Microsoft" / "Teams"
+        for p in (base / "Update.exe", base / "current" / "Teams.exe"):
+            try:
+                if p.is_file():
+                    return True
+            except OSError:
+                continue
+        return False
+
+    @staticmethod
+    def _teams_machine_wide_install_present(registry_entries: list[dict[str, str]]) -> bool:
+        for entry in registry_entries:
+            dn = str(entry.get("display_name", "")).lower()
+            if "machine-wide" not in dn and "machine wide" not in dn:
+                continue
+            if "teams" not in dn:
+                continue
+            if SoftwareScanner.registry_entry_signals_real_install(entry):
+                return True
+        return False
+
+    @staticmethod
+    def _teams_appx_or_msix_present() -> bool:
+        ps = (
+            "$ErrorActionPreference='SilentlyContinue';"
+            "$c=(Get-AppxPackage -AllUsers | Where-Object { $_.Name -match 'MSTeams|MicrosoftTeams' } | Measure-Object).Count;"
+            "$c2=(Get-AppxPackage | Where-Object { $_.Name -match 'MSTeams|MicrosoftTeams' } | Measure-Object).Count;"
+            "Write-Output ($c+$c2)"
+        )
+        try:
+            cp = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                capture_output=True,
+                text=True,
+                timeout=45,
+                check=False,
+                shell=False,
+            )
+            out = (cp.stdout or "").strip().splitlines()
+            if not out:
+                return False
+            n = int(out[-1].strip() or "0")
+            return n > 0
+        except (ValueError, OSError, subprocess.TimeoutExpired):
+            return False
+
+    @staticmethod
+    def _office365_physical_evidence() -> tuple[bool, list[str]]:
+        msgs: list[str] = []
+        pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        c2r = pf / "Common Files" / "Microsoft Shared" / "ClickToRun" / "OfficeClickToRun.exe"
+        if c2r.is_file():
+            msgs.append(f"OfficeClickToRun.exe present: {c2r}")
+        root16 = pf / "Microsoft Office" / "root" / "Office16"
+        for exe in ("WINWORD.EXE", "EXCEL.EXE", "POWERPNT.EXE", "OUTLOOK.EXE", "MSACCESS.EXE"):
+            p = root16 / exe
+            try:
+                if p.is_file():
+                    msgs.append(f"Office app binary: {p}")
+                    return True, msgs
+            except OSError:
+                continue
+        if c2r.is_file():
+            return True, msgs
+        alt = pf / "Microsoft Office"
+        try:
+            if alt.is_dir():
+                for hit in alt.rglob("WINWORD.EXE"):
+                    if hit.is_file():
+                        msgs.append(f"Office WINWORD: {hit}")
+                        return True, msgs
+        except OSError:
+            pass
+        return False, msgs
+
+    @staticmethod
+    def _office_click_to_run_service_active() -> bool:
+        try:
+            cp = subprocess.run(
+                ["sc", "query", "OfficeClickToRun"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+                shell=False,
+            )
+            out = ((cp.stdout or "") + (cp.stderr or "")).upper()
+            return "RUNNING" in out or "START_PENDING" in out
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    @staticmethod
+    def _office365_click_to_run_registry() -> tuple[bool, bool, list[str]]:
+        """Returns (c2r_registry_implies_installed, access_denied, messages)."""
+        if winreg is None:
+            return False, False, []
+        msgs: list[str] = []
+        access_denied = False
+        key_path = r"SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as k:
+                def q(name: str) -> str:
+                    try:
+                        v, _ = winreg.QueryValueEx(k, name)
+                        return str(v or "").strip()
+                    except OSError:
+                        return ""
+
+                pr = q("ProductReleaseIds") or q("ProductToConsumerVersion")
+                install_path = os.path.expandvars((q("InstallationPath") or q("ClientFolderToStaging") or "").strip())
+                if install_path and Path(install_path).exists():
+                    msgs.append(f"Office Click-to-Run InstallationPath exists: {install_path}")
+                    return True, False, msgs
+                if pr and len(pr) > 3 and SoftwareScanner._office_click_to_run_service_active():
+                    msgs.append("Office Click-to-Run service active with product configuration in registry")
+                    return True, False, msgs
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 5 or getattr(exc, "errno", None) in (13, 5):
+                access_denied = True
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Office\16.0\Common\InstallRoot") as k2:
+                path = ""
+                try:
+                    path, _ = winreg.QueryValueEx(k2, "Path")
+                except OSError:
+                    pass
+                path = os.path.expandvars(str(path or "").strip())
+                if path and Path(path).exists():
+                    msgs.append(f"Office InstallRoot Path exists: {path}")
+                    return True, False, msgs
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 5 or getattr(exc, "errno", None) in (13, 5):
+                access_denied = True
+        return False, access_denied, msgs
 
     def _read_registry_program_entries(self) -> list[dict[str, str]]:
         if winreg is None:

@@ -174,6 +174,9 @@ class InstallerService:
                         provider=new_state.provider or "",
                         installer_path=new_state.installer_path or "",
                         installer_sha256=new_state.installer_sha256 or "",
+                        uninstall_method="",
+                        uninstall_attempts_json="",
+                        manual_reason="",
                     )
                 )
 

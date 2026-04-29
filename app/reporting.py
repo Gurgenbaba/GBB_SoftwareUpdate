@@ -93,6 +93,12 @@ class ReportWriter:
                     "Provider",
                     "Installer Pfad",
                     "Installer SHA256",
+                    "Uninstall Methode",
+                    "Uninstall Versuche JSON",
+                    "Manuell Grund",
+                    "verification_status",
+                    "verification_evidence",
+                    "stale_evidence_ignored",
                 ]
             )
             for item in entries:
@@ -113,6 +119,12 @@ class ReportWriter:
                         item.provider,
                         item.installer_path,
                         item.installer_sha256,
+                        getattr(item, "uninstall_method", "") or "",
+                        getattr(item, "uninstall_attempts_json", "") or "",
+                        getattr(item, "manual_reason", "") or "",
+                        getattr(item, "verification_status", "") or "",
+                        getattr(item, "verification_evidence", "") or "",
+                        getattr(item, "stale_evidence_ignored", "") or "",
                     ]
                 )
         self.logger.info("CSV-Report gespeichert: %s", report_path)
@@ -133,6 +145,9 @@ class ReportWriter:
                     result="OK" if state.status != "Fehler" else "Fehler",
                     error_message=state.detail,
                     provider=state.provider or "",
+                    uninstall_method="",
+                    uninstall_attempts_json="",
+                    manual_reason="",
                 )
             )
         return entries

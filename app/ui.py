@@ -79,7 +79,14 @@ class UpdaterApp(ctk.CTk):
             local_source_service=self.local_source,
             prefer_local_source=self.runtime.local_source_prefer_local,
         )
-        self.uninstaller = UninstallerService(self.choco, self.winget, self.logger, runtime_by_key)
+        self.uninstaller = UninstallerService(
+            self.choco,
+            self.winget,
+            self.logger,
+            runtime_by_key,
+            scanner=self.scanner,
+            software_providers=self.runtime.software_providers,
+        )
         self.report_writer = ReportWriter(self.logger)
         self.system_tools = SystemToolsService(self.logger)
 
@@ -1761,7 +1768,14 @@ class UpdaterApp(ctk.CTk):
                 local_source_service=self.local_source,
                 prefer_local_source=self.runtime.local_source_prefer_local,
             )
-            self.uninstaller = UninstallerService(self.choco, self.winget, self.logger, runtime_by_key)
+            self.uninstaller = UninstallerService(
+                self.choco,
+                self.winget,
+                self.logger,
+                runtime_by_key,
+                scanner=self.scanner,
+                software_providers=self.runtime.software_providers,
+            )
             self._apply_title()
             self.company_label.configure(text=f"Company: {self.runtime.company_name or 'Nicht gesetzt'}")
             messagebox.showinfo(APP_NAME, "Einstellungen gespeichert. Bitte Programm neu starten, damit alle Änderungen aktiv werden.")
@@ -2005,7 +2019,12 @@ class UpdaterApp(ctk.CTk):
         return "\n".join(lines)
 
     @staticmethod
-    def _install_summary_message(rows: list[ReportEntry], dry_run: bool, mandatory: bool = False) -> str:
+    def _install_summary_message(
+        rows: list[ReportEntry],
+        dry_run: bool,
+        mandatory: bool = False,
+        operation: str = "install",
+    ) -> str:
         if dry_run:
             sim = noop = source_required = err = removed = reboot_required = 0
             for r in rows:
@@ -2032,6 +2051,26 @@ class UpdaterApp(ctk.CTk):
                 f"- {source_required} Quelle erforderlich\n"
                 f"- {err} Fehler\n"
                 f"- {reboot_required} Neustart erforderlich"
+            )
+        if operation == "remove" and not dry_run:
+            removed_ok = sum(
+                1
+                for r in rows
+                if r.result == "OK"
+                and "entfernen" in (r.action or "").lower()
+                and "manuelle" not in (r.action or "").lower()
+            )
+            absent = sum(1 for r in rows if (r.action or "") == "Keine Aktion erforderlich")
+            manual_req = sum(1 for r in rows if r.result == "Manuell" or "Manuelle" in (r.status_after or ""))
+            failed = sum(1 for r in rows if r.result == "Fehler")
+            reboot_required = sum(1 for r in rows if (r.reboot_required or "no").lower() == "yes")
+            return (
+                "Zusammenfassung (Entfernen):\n"
+                f"- {removed_ok} entfernt\n"
+                f"- {absent} bereits nicht installiert\n"
+                f"- {manual_req} manuelle Deinstallation nötig\n"
+                f"- {failed} fehlgeschlagen\n"
+                f"- {reboot_required} Neustart erforderlich\n"
             )
         n = len(rows)
         err = sum(1 for r in rows if r.result == "Fehler")
@@ -2184,6 +2223,20 @@ class UpdaterApp(ctk.CTk):
         def item_start_callback(key: str) -> None:
             self.ui_queue.put(("row_progress_start", key))
 
+        def method_progress_callback(key: str, label: str) -> None:
+            st0 = self.current_states.get(key, SoftwareState("Installiert"))
+            status_callback(
+                key,
+                SoftwareState(
+                    st0.status,
+                    package_name=st0.package_name,
+                    detail=label[:220],
+                    provider=st0.provider or "",
+                    installed_version=st0.installed_version,
+                    available_version=st0.available_version,
+                ),
+            )
+
         def resolution_callback(key: str, choco_package: str | None, winget_id: str | None) -> None:
             self.ui_queue.put(("resolved_source", {"key": key, "choco": choco_package, "winget": winget_id}))
 
@@ -2239,16 +2292,25 @@ class UpdaterApp(ctk.CTk):
                         progress_callback,
                         item_start_callback=item_start_callback,
                         dry_run=dry,
+                        scanner=self.scanner,
+                        software_providers=self.runtime.software_providers,
+                        method_progress_callback=method_progress_callback,
                     )
                 )
                 self.last_report_file = self.report_writer.write_report(rows, "install_report")
-                if mode == "install":
-                    pending_after = any((r.reboot_required or "no").lower() == "yes" for r in rows)
-                    if pending_after:
-                        self.ui_queue.put(("hint", "Neustart empfohlen/erforderlich"))
+                if mode == "remove" and not dry:
+                    self._queue_status("Installationsstatus wird aktualisiert...")
+                    fresh_remove = self.scanner.scan()
+                    self.current_states.update(fresh_remove)
+                    for rk in keys:
+                        if rk in fresh_remove:
+                            self.ui_queue.put(("software_row", (rk, fresh_remove[rk])))
+                pending_after = any((r.reboot_required or "no").lower() == "yes" for r in rows)
+                if pending_after:
+                    self.ui_queue.put(("hint", "Neustart empfohlen/erforderlich"))
                 self.logger.info("Vorgang abgeschlossen.")
                 self._queue_status("OK - Vorgang abgeschlossen.")
-                summary = self._install_summary_message(rows, dry, mandatory=mandatory)
+                summary = self._install_summary_message(rows, dry, mandatory=mandatory, operation=mode)
                 outro = (
                     "Bitte unnötige Installationsdateien oder Downloads löschen und installierte Programme kurz testen."
                     if mode == "install"

@@ -42,6 +42,15 @@
         "path": "",
         "silent_args": ""
       },
+      "uninstall": {
+        "processes": [],
+        "choco_id": "",
+        "winget_id": "",
+        "registry_names": ["citrix", "receiver"],
+        "appx_names": [],
+        "uninstall_silent_args": [],
+        "vendor_uninstall": { "type": "", "path": "", "args": [] }
+      },
       "search_terms": ["citrix workspace", "citrix"]
     },
     "adobe_reader": {
@@ -75,6 +84,15 @@
         "path": "",
         "silent_args": ""
       },
+      "uninstall": {
+        "processes": ["teams.exe", "ms-teams.exe"],
+        "registry_names": ["teams", "microsoft teams"],
+        "appx_names": ["MSTeams", "MicrosoftTeams"],
+        "choco_id": "",
+        "winget_id": "",
+        "uninstall_silent_args": [],
+        "vendor_uninstall": { "type": "", "path": "", "args": [] }
+      },
       "search_terms": ["microsoft teams", "teams"]
     },
     "office365business": {
@@ -85,6 +103,15 @@
       "internal_installer": {
         "path": "",
         "silent_args": ""
+      },
+      "uninstall": {
+        "processes": ["winword.exe", "excel.exe", "outlook.exe", "teams.exe"],
+        "registry_names": ["microsoft 365", "office", "click-to-run"],
+        "appx_names": [],
+        "choco_id": "",
+        "winget_id": "",
+        "uninstall_silent_args": [],
+        "vendor_uninstall": { "type": "", "path": "", "args": [] }
       },
       "search_terms": ["office 365 business", "m365", "microsoft 365"]
     },
