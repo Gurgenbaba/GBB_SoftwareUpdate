@@ -32,6 +32,18 @@
       "endpoint_keycode": ""
     }
   },
+  "enable_backup": true,
+  "dry_run_default": false,
+  "office_tools": {
+    "get_help_cmd_path": "",
+    "get_help_args": ["OfficeScrubScenario"],
+    "odt_setup_path": "\\\\fileserver\\software\\OfficeODT\\setup.exe",
+    "odt_remove_config_path": "\\\\fileserver\\software\\OfficeODT\\remove365.xml",
+    "sara_path": "",
+    "sara_args": [],
+    "prefer": ["get_help", "odt", "sara", "generic"],
+    "kill_click_to_run_service": false
+  },
   "software_providers": {
     "citrix_workspace": {
       "enabled": true,
@@ -71,6 +83,8 @@
       "display_name": "Adobe Acrobat Reader",
       "choco_package": "adobereader",
       "winget_id": "Adobe.Acrobat.Reader.64-bit",
+      "install_mode": "silent",
+      "provider_priority": ["winget", "choco", "internal"],
       "internal_installer": {
         "path": "",
         "silent_args": ""
@@ -82,6 +96,15 @@
       "display_name": "TeamViewer",
       "choco_package": "teamviewer",
       "winget_id": "TeamViewer.TeamViewer",
+      "identity": {
+        "detect_names": ["teamviewer"],
+        "registry_names": ["teamviewer"],
+        "negative_names": ["teamspeak"],
+        "winget_id": "",
+        "choco_id": "",
+        "cleanup_paths": [],
+        "safe_processes": []
+      },
       "internal_installer": {
         "path": "",
         "silent_args": ""
@@ -93,6 +116,21 @@
       "display_name": "Microsoft Teams",
       "choco_package": "microsoft-teams",
       "winget_id": "Microsoft.Teams",
+      "identity": {
+        "detect_names": ["microsoft-teams", "ms-teams", "msteams"],
+        "registry_names": [
+          "microsoft teams",
+          "msteams",
+          "ms teams",
+          "teams machine-wide",
+          "teams work or school"
+        ],
+        "negative_names": ["teamspeak", "teamviewer"],
+        "winget_id": "",
+        "choco_id": "",
+        "cleanup_paths": [],
+        "safe_processes": []
+      },
       "internal_installer": {
         "path": "",
         "silent_args": ""

@@ -25,6 +25,61 @@ def test_winget_no_upgrade_classifies_as_ok_already_current() -> None:
     assert nv.substatus == "Bereits aktuell"
 
 
+def test_cleanup_choco_ghost_metadata_friendlier_detail() -> None:
+    r = ReportEntry(
+        software_key="firefox",
+        package_name="firefox",
+        status_before="Installiert",
+        action="Entfernen",
+        status_after="Nicht installiert",
+        result="OK",
+        error_message="Chocolatey failed RC=1",
+        reboot_required="no",
+        provider="Choco",
+        extended_metadata="cleanup_choco_ghost=true",
+    )
+    nv = normalize_report_entry(r)
+    assert nv.severity == "OK"
+    assert "veralteter" in nv.user_detail.lower()
+
+
+def test_office_removal_guidance_manuell_is_hinweis_not_error() -> None:
+    r = ReportEntry(
+        software_key="office365business",
+        package_name="",
+        status_before="Installiert",
+        action="Manuelle Deinstallation",
+        status_after="Fehler: Manuelle Deinstallation nötig",
+        result="Manuell",
+        error_message="",
+        manual_reason="Kein erweitertes Office-Removal-Tool gefunden.",
+        extended_metadata="office_removal_guidance=true",
+    )
+    nv = normalize_report_entry(r)
+    assert nv.severity == "WARNING"
+    assert "Hinweis" in nv.substatus
+    lines = format_install_summary_lines([r], dry_run=False, mandatory=False, operation="remove")
+    assert any("Hinweise" in ln for ln in lines)
+    assert any("Fehler: 0" in ln for ln in lines)
+
+
+def test_office_removal_guidance_fehler_row_downgraded_to_warning() -> None:
+    r = ReportEntry(
+        software_key="office365business",
+        package_name="",
+        status_before="Installiert",
+        action="Entfernen",
+        status_after="Fehler: Deinstallation fehlgeschlagen",
+        result="Fehler",
+        error_message="WinGet failed",
+        manual_reason="",
+        extended_metadata="office_removal_guidance=true",
+    )
+    nv = normalize_report_entry(r)
+    assert nv.severity == "WARNING"
+    assert "Hinweis" in nv.substatus
+
+
 def test_quelle_erforderlich_is_warning() -> None:
     r = ReportEntry(
         software_key="x",

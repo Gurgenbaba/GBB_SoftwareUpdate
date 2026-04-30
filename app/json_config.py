@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .identity import apply_identity_defaults_to_providers, merge_identity_into_catalog_fields
 from .config import (
     APP_DIR,
     BUNDLE_DIR,
@@ -71,6 +72,18 @@ DEFAULT_EXAMPLE_CONFIG: dict[str, Any] = {
         "name": "chocolatey",
         "url": "https://community.chocolatey.org/api/v2/",
     },
+    "enable_backup": True,
+    "dry_run_default": False,
+    "office_tools": {
+        "get_help_cmd_path": "",
+        "get_help_args": ["OfficeScrubScenario"],
+        "odt_setup_path": "",
+        "odt_remove_config_path": "",
+        "sara_path": "",
+        "sara_args": "",
+        "prefer": ["get_help", "odt", "sara", "generic"],
+        "kill_click_to_run_service": False,
+    },
     "installer_behavior": {
         "settle_wait_seconds": 60,
         "verify_after_timeout": True,
@@ -98,8 +111,11 @@ class RuntimeSettings:
     chocolatey_source: ChocolateySourceConfig | None
     visible_catalog: tuple[Any, ...]
     software_providers: dict[str, Any]
+    office_tools: dict[str, Any]
     local_source_last_path: str
     local_source_prefer_local: bool
+    enable_backup: bool = True
+    dry_run_default: bool = False
     installer_settle_wait_seconds: int = INSTALLER_SETTLE_WAIT_SECONDS
     installer_verify_after_timeout: bool = INSTALLER_VERIFY_AFTER_TIMEOUT
     installer_verify_poll_interval_seconds: int = INSTALLER_VERIFY_POLL_INTERVAL_SECONDS
@@ -236,6 +252,47 @@ def _parse_enabled_keys(raw: Any) -> frozenset[str] | None:
     return selected
 
 
+def _parse_office_tools(raw: Any) -> dict[str, Any]:
+    defaults: dict[str, Any] = {
+        "get_help_cmd_path": "",
+        "get_help_args": ["OfficeScrubScenario"],
+        "odt_setup_path": "",
+        "odt_remove_config_path": "",
+        "sara_path": "",
+        "sara_args": "",
+        "prefer": ["get_help", "odt", "sara", "generic"],
+        "kill_click_to_run_service": False,
+    }
+    if not isinstance(raw, dict):
+        return defaults.copy()
+    pref = raw.get("prefer")
+    prefer_l = list(defaults["prefer"])
+    if isinstance(pref, list) and pref:
+        prefer_l = [str(x).strip().lower() for x in pref if str(x).strip()]
+    gh_args = raw.get("get_help_args", defaults["get_help_args"])
+    if isinstance(gh_args, list):
+        gh_list = [str(x).strip() for x in gh_args if str(x).strip()]
+    else:
+        gh_list = [str(gh_args).strip()] if str(gh_args or "").strip() else list(defaults["get_help_args"])
+    if not gh_list:
+        gh_list = list(defaults["get_help_args"])
+    sara_raw = raw.get("sara_args", "")
+    if isinstance(sara_raw, list):
+        sara_norm = " ".join(str(x).strip() for x in sara_raw if str(x).strip())
+    else:
+        sara_norm = str(sara_raw or "").strip()
+    return {
+        "get_help_cmd_path": str(raw.get("get_help_cmd_path", "") or "").strip(),
+        "get_help_args": gh_list,
+        "odt_setup_path": str(raw.get("odt_setup_path", "") or "").strip(),
+        "odt_remove_config_path": str(raw.get("odt_remove_config_path", "") or "").strip(),
+        "sara_path": str(raw.get("sara_path", "") or "").strip(),
+        "sara_args": sara_norm,
+        "prefer": prefer_l,
+        "kill_click_to_run_service": bool(raw.get("kill_click_to_run_service", False)),
+    }
+
+
 def load_runtime_settings(logger: logging.Logger | None = None) -> RuntimeSettings:
     data = get_config_dict(logger)
     company_name = str(data.get("company_name", "") or "").strip()
@@ -245,11 +302,15 @@ def load_runtime_settings(logger: logging.Logger | None = None) -> RuntimeSettin
     software_providers = data.get("software_providers")
     if not isinstance(software_providers, dict) or not software_providers:
         software_providers = default_software_providers()
+    apply_identity_defaults_to_providers(software_providers)
     local_source = data.get("local_source", {})
     if not isinstance(local_source, dict):
         local_source = {}
     local_source_last_path = str(local_source.get("last_path", "") or "").strip()
     local_source_prefer_local = bool(local_source.get("prefer_local", True))
+    enable_backup = bool(data.get("enable_backup", True))
+    dry_run_default = bool(data.get("dry_run_default", False))
+    office_tools = _parse_office_tools(data.get("office_tools"))
 
     settle_wait = INSTALLER_SETTLE_WAIT_SECONDS
     verify_after_timeout = INSTALLER_VERIFY_AFTER_TIMEOUT
@@ -291,12 +352,13 @@ def load_runtime_settings(logger: logging.Logger | None = None) -> RuntimeSettin
             internal = {}
         terms = raw.get("search_terms", list(software.search_terms))
         term_tuple = tuple(str(x).strip() for x in terms if str(x).strip()) if isinstance(terms, list) else software.search_terms
+        pp_merged, wg_merged = merge_identity_into_catalog_fields(raw, software)
         customized.append(
             replace(
                 software,
                 display_name=str(raw.get("display_name", software.display_name) or software.display_name),
-                primary_package=(str(raw.get("choco_package", software.primary_package or "")).strip() or None),
-                winget_id=(str(raw.get("winget_id", software.winget_id or "")).strip() or None),
+                primary_package=pp_merged,
+                winget_id=wg_merged,
                 installer_source=(str(internal.get("path", software.installer_source or "")).strip() or None),
                 search_terms=term_tuple or software.search_terms,
             )
@@ -321,8 +383,11 @@ def load_runtime_settings(logger: logging.Logger | None = None) -> RuntimeSettin
         chocolatey_source=choco_source,
         visible_catalog=visible,
         software_providers=software_providers,
+        office_tools=office_tools,
         local_source_last_path=local_source_last_path,
         local_source_prefer_local=local_source_prefer_local,
+        enable_backup=enable_backup,
+        dry_run_default=dry_run_default,
         installer_settle_wait_seconds=settle_wait,
         installer_verify_after_timeout=verify_after_timeout,
         installer_verify_poll_interval_seconds=poll_interval,

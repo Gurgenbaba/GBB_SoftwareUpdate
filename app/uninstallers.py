@@ -1,11 +1,27 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Callable
+from typing import AbstractSet, Any, Callable
 
 from .config import SOFTWARE_BY_KEY, SoftwarePackage
 from .models import ReportEntry, SoftwareState
 from .uninstall_engine import MultiStageUninstallEngine, UninstallEngineResult
+
+
+def _office_removal_metadata(eng: UninstallEngineResult) -> str:
+    parts: list[str] = []
+    for key in (
+        "office_removal_strategy_used",
+        "office_removal_exit_code",
+        "office_removal_config_path",
+        "office_removal_verification",
+    ):
+        val = (getattr(eng, key, "") or "").strip()
+        if val:
+            parts.append(f"{key}={val}")
+    if getattr(eng, "office_removal_guidance", False):
+        parts.append("office_removal_guidance=true")
+    return ";".join(parts)
 
 
 class UninstallerService:
@@ -17,6 +33,7 @@ class UninstallerService:
         software_by_key: dict[str, SoftwarePackage] | None = None,
         scanner=None,
         software_providers: dict[str, Any] | None = None,
+        office_tools: dict[str, Any] | None = None,
     ) -> None:
         self.choco = choco_client
         self.winget = winget_client
@@ -24,6 +41,7 @@ class UninstallerService:
         self.software_by_key = software_by_key or SOFTWARE_BY_KEY
         self.scanner = scanner
         self.software_providers = software_providers or {}
+        self.office_tools = office_tools if isinstance(office_tools, dict) else {}
 
     @staticmethod
     def _attempts_json(eng: UninstallEngineResult) -> str:
@@ -62,6 +80,7 @@ class UninstallerService:
         scanner=None,
         software_providers: dict[str, Any] | None = None,
         method_progress_callback: Callable[[str, str], None] | None = None,
+        office_removal_generic_ack_keys: AbstractSet[str] | None = None,
     ) -> list[ReportEntry]:
         scan = scanner if scanner is not None else self.scanner
         prov = software_providers if software_providers is not None else self.software_providers
@@ -72,6 +91,7 @@ class UninstallerService:
             self.software_by_key,
             scanner=scan,
             software_providers=prov,
+            office_tools=self.office_tools,
         )
         total = len(selected_keys)
         rows: list[ReportEntry] = []
@@ -81,7 +101,14 @@ class UninstallerService:
                 item_start_callback(key)
             software = self.software_by_key[key]
             prev = current_states.get(key, SoftwareState("Nicht geprueft"))
-            eng = engine.execute(software, prev, dry_run, method_progress_callback=method_progress_callback)
+            ack = bool(office_removal_generic_ack_keys and key in office_removal_generic_ack_keys)
+            eng = engine.execute(
+                software,
+                prev,
+                dry_run,
+                method_progress_callback=method_progress_callback,
+                office_removal_generic_ack=ack,
+            )
             new_state = eng.final_state or SoftwareState("Fehler", detail=eng.error_summary or eng.manual_reason)
             current_states[key] = new_state
             status_callback(key, new_state)
@@ -107,6 +134,7 @@ class UninstallerService:
                     cleanup_items_found="",
                     cleanup_items_removed="",
                     cleanup_classification="",
+                    extended_metadata=_office_removal_metadata(eng),
                 )
             )
         return rows

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import getpass
+import html
 import importlib
 import re
 import socket
@@ -102,6 +103,7 @@ class ReportWriter:
                     "cleanup_items_found",
                     "cleanup_items_removed",
                     "cleanup_classification",
+                    "extended_metadata",
                 ]
             )
             for item in entries:
@@ -131,6 +133,7 @@ class ReportWriter:
                         getattr(item, "cleanup_items_found", "") or "",
                         getattr(item, "cleanup_items_removed", "") or "",
                         getattr(item, "cleanup_classification", "") or "",
+                        getattr(item, "extended_metadata", "") or "",
                     ]
                 )
         self.logger.info("CSV-Report gespeichert: %s", report_path)
@@ -154,6 +157,43 @@ class ReportWriter:
                     uninstall_method="",
                     uninstall_attempts_json="",
                     manual_reason="",
+                    extended_metadata="",
                 )
             )
         return entries
+
+
+def write_html_report(entries: list[ReportEntry], report_type: str, title_line: str) -> Path:
+    """UTF-8 HTML summary next to CSV naming convention."""
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = REPORT_DIR / f"{report_type}_{stamp}.html"
+    rows: list[str] = []
+    for item in entries:
+        software = SOFTWARE_BY_KEY.get(item.software_key)
+        name = software.display_name if software else item.software_key
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(name)}</td>"
+            f"<td>{html.escape(item.action)}</td>"
+            f"<td>{html.escape(item.status_after)}</td>"
+            f"<td>{html.escape(item.result)}</td>"
+            f"<td>{html.escape(item.provider)}</td>"
+            f"<td>{html.escape(item.verification_status or '')}</td>"
+            f"<td>{html.escape(item.cleanup_classification or '')}</td>"
+            f"<td>{html.escape(item.reboot_required)}</td>"
+            "</tr>"
+        )
+    body = f"""<!DOCTYPE html>
+<html lang="de"><head><meta charset="utf-8"/><title>{html.escape(title_line)}</title>
+<style>body{{font-family:Segoe UI,Arial,sans-serif;margin:24px;}} table{{border-collapse:collapse;width:100%;max-width:1200px;}}
+th,td{{border:1px solid #ccc;padding:6px 8px;text-align:left;font-size:13px;}} th{{background:#f4f4f4;}}</style></head>
+<body><h1>{html.escape(title_line)}</h1>
+<p>{html.escape(stamp)} · {html.escape(socket.gethostname())} · {html.escape(getpass.getuser())}</p>
+<table><thead><tr>
+<th>Software</th><th>Aktion</th><th>Status</th><th>Ergebnis</th><th>Provider</th><th>Verifikation</th><th>Bereinigung</th><th>Neustart</th>
+</tr></thead><tbody>
+{"".join(rows)}
+</tbody></table></body></html>"""
+    path.write_text(body, encoding="utf-8")
+    return path

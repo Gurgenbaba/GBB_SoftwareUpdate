@@ -17,7 +17,15 @@ except ImportError:  # pragma: no cover - Windows only
     winreg = None
 
 from .config import INSTALL_TIMEOUT_SECONDS, SOFTWARE_ALIASES, SOFTWARE_BY_KEY, SoftwarePackage
+from .enterprise import parse_install_mode
+from .identity import normalize_identity_block, term_matches_display
 from .models import SoftwareState
+from .office_uninstall import (
+    office_removal_tools_available,
+    office_tools_configured,
+    run_office_removal_strategies,
+    stop_safe_office_processes,
+)
 from .scanner import PostUninstallVerification, SoftwareScanner
 
 EXCERPT_LEN = 600
@@ -75,6 +83,12 @@ def merge_uninstall_profile(software_key: str, provider_cfg: dict[str, Any]) -> 
             base[key] = list(dict.fromkeys(merged))
         else:
             base[key] = val
+    ident = normalize_identity_block(provider_cfg if isinstance(provider_cfg, dict) else {})
+    if ident["registry_names"]:
+        base["registry_names"] = list(ident["registry_names"])
+    if ident["safe_processes"]:
+        proc = base.get("processes") if isinstance(base.get("processes"), list) else []
+        base["processes"] = list(dict.fromkeys([*proc, *ident["safe_processes"]]))
     return base
 
 
@@ -104,6 +118,27 @@ class UninstallEngineResult:
     verification_status: str = ""
     verification_evidence: str = ""
     stale_evidence_ignored: str = ""
+    office_removal_strategy_used: str = ""
+    office_removal_exit_code: str = ""
+    office_removal_config_path: str = ""
+    office_removal_verification: str = ""
+    office_removal_guidance: bool = False
+
+
+def _office_removal_result_fields(software_key: str, office_meta: dict[str, str]) -> dict[str, str]:
+    if software_key != "office365business":
+        return {
+            "office_removal_strategy_used": "",
+            "office_removal_exit_code": "",
+            "office_removal_config_path": "",
+            "office_removal_verification": "",
+        }
+    return {
+        "office_removal_strategy_used": office_meta.get("office_removal_strategy_used", ""),
+        "office_removal_exit_code": office_meta.get("office_removal_exit_code", ""),
+        "office_removal_config_path": office_meta.get("office_removal_config_path", ""),
+        "office_removal_verification": office_meta.get("office_removal_verification", ""),
+    }
 
 
 def enumerate_uninstall_entries() -> list[dict[str, str]]:
@@ -219,6 +254,7 @@ class MultiStageUninstallEngine:
         software_by_key: dict[str, SoftwarePackage] | None = None,
         scanner=None,
         software_providers: dict[str, Any] | None = None,
+        office_tools: dict[str, Any] | None = None,
     ) -> None:
         self.choco = choco_client
         self.winget = winget_client
@@ -226,6 +262,7 @@ class MultiStageUninstallEngine:
         self.software_by_key = software_by_key or SOFTWARE_BY_KEY
         self.scanner = scanner
         self.software_providers = software_providers or {}
+        self.office_tools = office_tools if isinstance(office_tools, dict) else {}
 
     def _ulog(self, software: SoftwarePackage, msg: str, *args: Any) -> None:
         """Log an uninstall line; supports ``msg`` only or ``msg % args`` like ``logger.info``."""
@@ -244,8 +281,15 @@ class MultiStageUninstallEngine:
         prev: SoftwareState,
         dry_run: bool,
         method_progress_callback: Callable[[str, str], None] | None = None,
+        office_removal_generic_ack: bool = False,
     ) -> UninstallEngineResult:
         attempts: list[UninstallAttempt] = []
+        office_meta: dict[str, str] = {
+            "office_removal_strategy_used": "",
+            "office_removal_exit_code": "",
+            "office_removal_config_path": "",
+            "office_removal_verification": "",
+        }
         profile = merge_uninstall_profile(software.key, self.software_providers.get(software.key, {}))
 
         def progress(label: str) -> None:
@@ -289,6 +333,43 @@ class MultiStageUninstallEngine:
                 verification_status="already_absent",
                 verification_evidence="Vor der Deinstallation als nicht installiert erkannt.",
                 stale_evidence_ignored="",
+                **_office_removal_result_fields(software.key, office_meta),
+            )
+
+        if (
+            software.key == "office365business"
+            and not dry_run
+            and not office_removal_tools_available(self.office_tools, self.logger)
+            and not office_removal_generic_ack
+        ):
+            manual_reason = (
+                "Kein erweitertes Office-Removal-Tool gefunden. "
+                "Für sauberes Entfernen bitte ODT oder Microsoft Get Help bereitstellen."
+            )
+            add_att("precheck", "skipped", det="no_office_removal_tools_without_generic_ack")
+            st = SoftwareState(
+                "Hinweis: Office-Removal-Tool fehlt",
+                detail=manual_reason[:500],
+                provider="Intern",
+                package_name=prev.package_name,
+            )
+            return UninstallEngineResult(
+                software.key,
+                software.display_name,
+                "uninstall",
+                "manual_required",
+                "",
+                attempts,
+                False,
+                manual_reason,
+                "",
+                st,
+                "Manuelle Deinstallation",
+                verification_status="",
+                verification_evidence="",
+                stale_evidence_ignored="",
+                **_office_removal_result_fields(software.key, office_meta),
+                office_removal_guidance=True,
             )
 
         cleanup_messages: list[str] = []
@@ -299,7 +380,32 @@ class MultiStageUninstallEngine:
 
         if dry_run:
             progress("Dry-Run (Plan)")
-            add_att("dry_run", "success", det="Would run: process-stop, Chocolatey, WinGet, Registry, MSI, AppX, vendor")
+            add_att(
+                "dry_run",
+                "success",
+                det="Would run: Office safe process stop, Get Help/ODT/SaRA (if configured), process-stop, Chocolatey, WinGet, Registry, MSI, AppX, vendor",
+            )
+            if software.key == "office365business":
+                kill_svc = bool(self.office_tools.get("kill_click_to_run_service", False))
+                stop_safe_office_processes(
+                    logger=self.logger,
+                    dry_run=True,
+                    kill_click_to_run_service=kill_svc,
+                )
+                im = parse_install_mode(self.software_providers.get(software.key, {}))
+                oc = run_office_removal_strategies(
+                    office_tools=self.office_tools,
+                    logger=self.logger,
+                    dry_run=True,
+                    add_att=add_att,
+                    scanner=self.scanner,
+                    software=software,
+                    install_mode=im,
+                )
+                office_meta["office_removal_strategy_used"] = oc.strategy_used
+                office_meta["office_removal_exit_code"] = oc.exit_code
+                office_meta["office_removal_config_path"] = oc.config_path
+                office_meta["office_removal_verification"] = oc.verification
             st = SoftwareState(
                 "Dry-Run (unveraendert)",
                 detail="DRY-RUN: Multi-Stage Uninstall wuerde ausgefuehrt",
@@ -318,7 +424,42 @@ class MultiStageUninstallEngine:
                 "",
                 st,
                 "DRY-RUN: wuerde entfernen",
+                **_office_removal_result_fields(software.key, office_meta),
             )
+
+        if software.key == "office365business":
+            progress("Office sicher beenden")
+            kill_svc = bool(self.office_tools.get("kill_click_to_run_service", False))
+            stop_safe_office_processes(
+                logger=self.logger,
+                dry_run=False,
+                kill_click_to_run_service=kill_svc,
+            )
+            progress("Office removal (Get Help / ODT / SaRA)")
+            im = parse_install_mode(self.software_providers.get(software.key, {}))
+            oc = run_office_removal_strategies(
+                office_tools=self.office_tools,
+                logger=self.logger,
+                dry_run=False,
+                add_att=add_att,
+                scanner=self.scanner,
+                software=software,
+                install_mode=im,
+            )
+            office_meta["office_removal_strategy_used"] = oc.strategy_used
+            office_meta["office_removal_exit_code"] = oc.exit_code
+            office_meta["office_removal_config_path"] = oc.config_path
+            office_meta["office_removal_verification"] = oc.verification
+            if oc.summary_notes:
+                cleanup_messages.append(oc.summary_notes[:400])
+            if oc.any_tool_exit_ok:
+                method_used = method_used or (oc.strategy_used or "Office removal tools")
+            try:
+                rc_i = int(oc.exit_code) if str(oc.exit_code).strip() else None
+            except ValueError:
+                rc_i = None
+            if rc_i in (3010, 1641):
+                reboot_required = True
 
         progress("Process stop (related)")
         killed, kill_detail = self._terminate_related_processes(software, dry_run=False, profile=profile)
@@ -508,6 +649,12 @@ class MultiStageUninstallEngine:
         self._append_access_denied_hint(cleanup_messages)
         detail_blob = " | ".join(m for m in cleanup_messages if m).strip()[:500]
 
+        office_guidance_context = (
+            software.key == "office365business"
+            and office_removal_generic_ack
+            and not office_removal_tools_available(self.office_tools, self.logger)
+        )
+
         if absent:
             st = SoftwareState("Nicht installiert", detail=detail_blob, provider="Intern", package_name=prev.package_name)
             return UninstallEngineResult(
@@ -525,6 +672,7 @@ class MultiStageUninstallEngine:
                 verification_status=verification.verification_status,
                 verification_evidence=verification.evidence,
                 stale_evidence_ignored=verification.stale_evidence_ignored,
+                **_office_removal_result_fields(software.key, office_meta),
             )
 
         manual_reason = ""
@@ -533,6 +681,12 @@ class MultiStageUninstallEngine:
                 "Office/Click-to-Run konnte nicht verifiziert werden (Registry: Zugriff verweigert). "
                 "Als Administrator ausfuehren, Office-Anwendungen schliessen oder ODT/SaRA nutzen."
             )
+            if software.key == "office365business" and not office_tools_configured(
+                self.office_tools, logger=self.logger
+            ):
+                manual_reason += (
+                    " Erweitertes Removal: office_tools.get_help_cmd_path oder odt_setup_path (+ remove.xml) setzen."
+                )
             st = SoftwareState(
                 "Fehler: Manuelle Deinstallation nötig",
                 detail=" | ".join(x for x in (detail_blob, manual_reason, verification.evidence) if x).strip()[:500],
@@ -554,6 +708,8 @@ class MultiStageUninstallEngine:
                 verification_status=verification.verification_status,
                 verification_evidence=verification.evidence,
                 stale_evidence_ignored=verification.stale_evidence_ignored,
+                **_office_removal_result_fields(software.key, office_meta),
+                office_removal_guidance=office_guidance_context,
             )
 
         if self._registry_has_actionable_match(software, prev, profile):
@@ -586,9 +742,40 @@ class MultiStageUninstallEngine:
                 verification_status=verification.verification_status,
                 verification_evidence=verification.evidence,
                 stale_evidence_ignored=verification.stale_evidence_ignored,
+                **_office_removal_result_fields(software.key, office_meta),
+                office_removal_guidance=office_guidance_context,
             )
 
         if hard_failures:
+            if office_guidance_context:
+                manual_reason = (
+                    "Kein erweitertes Office-Removal-Tool gefunden; generische Deinstallation fehlgeschlagen: "
+                    + "; ".join(hard_failures)
+                )[:900]
+                st = SoftwareState(
+                    "Fehler: Manuelle Deinstallation nötig",
+                    detail=" | ".join(x for x in (detail_blob, manual_reason) if x).strip()[:500],
+                    provider="Intern",
+                )
+                add_att("final", "failed", det=manual_reason[:EXCERPT_LEN])
+                return UninstallEngineResult(
+                    software.key,
+                    software.display_name,
+                    "uninstall",
+                    "manual_required",
+                    method_used,
+                    attempts,
+                    reboot_required,
+                    manual_reason,
+                    detail_blob,
+                    st,
+                    "Manuelle Deinstallation",
+                    verification_status=verification.verification_status,
+                    verification_evidence=verification.evidence,
+                    stale_evidence_ignored=verification.stale_evidence_ignored,
+                    **_office_removal_result_fields(software.key, office_meta),
+                    office_removal_guidance=True,
+                )
             st = SoftwareState("Fehler: Deinstallation fehlgeschlagen", detail=" | ".join([*hard_failures, detail_blob])[:500], provider="Intern")
             add_att("final", "failed", det=";".join(hard_failures)[:200])
             return UninstallEngineResult(
@@ -606,12 +793,29 @@ class MultiStageUninstallEngine:
                 verification_status=verification.verification_status,
                 verification_evidence=verification.evidence,
                 stale_evidence_ignored=verification.stale_evidence_ignored,
+                **_office_removal_result_fields(software.key, office_meta),
             )
 
         manual_reason = (
             verification.evidence
             or "Post-verify meldet die Software weiterhin als installiert; keine stille ARP-Route mehr."
         )
+        if software.key == "office365business":
+            if office_guidance_context:
+                manual_reason = (
+                    "Kein erweitertes Office-Removal-Tool gefunden; generische Deinstallation hat Office nicht zuverlässig entfernt. "
+                    + manual_reason
+                )[:900]
+            elif not office_tools_configured(self.office_tools, logger=self.logger):
+                manual_reason = (
+                    "Office benötigt erweitertes Removal: Get Help CLI oder ODT konfigurieren (config.json → office_tools). "
+                    + manual_reason
+                )[:900]
+            else:
+                manual_reason = (
+                    "Office weiterhin erkannt trotz konfigurierter Removal-Tools; Neustart oder manuelle Schritte prüfen. "
+                    + manual_reason
+                )[:900]
         st = SoftwareState(
             "Fehler: Manuelle Deinstallation nötig",
             detail=" | ".join(x for x in (detail_blob, manual_reason) if x).strip()[:500],
@@ -633,6 +837,8 @@ class MultiStageUninstallEngine:
             verification_status=verification.verification_status,
             verification_evidence=verification.evidence,
             stale_evidence_ignored=verification.stale_evidence_ignored,
+            **_office_removal_result_fields(software.key, office_meta),
+            office_removal_guidance=office_guidance_context,
         )
 
     @staticmethod
@@ -940,7 +1146,8 @@ class MultiStageUninstallEngine:
             return True
         prof = profile or {}
         for rn in prof.get("registry_names", []) or []:
-            if rn and str(rn).lower() in name:
+            s = str(rn).strip().lower()
+            if s and term_matches_display(name, s):
                 return True
         return False
 

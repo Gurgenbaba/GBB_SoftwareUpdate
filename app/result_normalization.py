@@ -69,6 +69,8 @@ def _mentions(text_lower: str, phrases: tuple[str, ...]) -> bool:
 def normalize_report_entry(entry: ReportEntry) -> NormalizedReportRow:
     """Map raw provider / engine fields to OK | WARNING | ERROR + German substatus."""
     raw_res = (entry.result or "").strip()
+    if raw_res == "OK" and "cleanup_choco_ghost=true" in (getattr(entry, "extended_metadata", "") or ""):
+        return NormalizedReportRow("OK", "", "Erfolgreich entfernt – veralteter Eintrag ignoriert")
     st_after = (entry.status_after or "").strip()
     action = (entry.action or "").strip()
     merged = _merged_lower(entry)
@@ -80,11 +82,19 @@ def normalize_report_entry(entry: ReportEntry) -> NormalizedReportRow:
             entry.error_message or "Keine gültige Installationsquelle gefunden.",
         )
 
+    em_meta = getattr(entry, "extended_metadata", "") or ""
     if raw_res == "Manuell" or "manuelle pruefung" in merged or "manuelle prüfung" in merged or "manuelle pruefung noetig" in merged:
+        detail = (entry.manual_reason or entry.error_message or "Manuelle Prüfung erforderlich.").strip()[:400]
+        if "office_removal_guidance=true" in em_meta:
+            return NormalizedReportRow(
+                "WARNING",
+                "Hinweis — Manuelle Prüfung nötig",
+                detail,
+            )
         return NormalizedReportRow(
             "WARNING",
             "Manuelle Prüfung nötig",
-            (entry.manual_reason or entry.error_message or "Manuelle Prüfung erforderlich.").strip()[:400],
+            detail,
         )
 
     if raw_res == "OK" and action == "Keine Aktion erforderlich":
@@ -98,6 +108,12 @@ def normalize_report_entry(entry: ReportEntry) -> NormalizedReportRow:
 
     # Raw Fehler — may be benign (already there / noop).
     if raw_res == "Fehler":
+        if "office_removal_guidance=true" in em_meta:
+            return NormalizedReportRow(
+                "WARNING",
+                "Hinweis — Manuelle Prüfung nötig",
+                (entry.manual_reason or entry.error_message or "Manuelle Prüfung erforderlich.").strip()[:400],
+            )
         if _mentions(merged, _ALREADY_INSTALLED_PHRASES) and ("install" in action.lower() or "interner" in action.lower()):
             return NormalizedReportRow(
                 "OK",

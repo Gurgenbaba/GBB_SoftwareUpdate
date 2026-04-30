@@ -283,3 +283,7 @@ class ChocoClient:
     def upgrade(self, package_name: str, *, use_native_installer_ui: bool = False) -> CommandResult:
         extra = ["--notSilent"] if use_native_installer_ui else []
         return self.run(["upgrade", package_name, "-y", *extra], hide_console=True)
+
+    def uninstall_remove_metadata_only(self, package_name: str) -> CommandResult:
+        """Remove Chocolatey lib metadata when the app is already gone (ghost entry)."""
+        return self.run(["uninstall", package_name, "-y", "--skip-autouninstaller"], hide_console=True)

@@ -38,3 +38,4 @@ class ReportEntry:
     cleanup_items_found: str = ""
     cleanup_items_removed: str = ""
     cleanup_classification: str = ""
+    extended_metadata: str = ""

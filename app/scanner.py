@@ -6,6 +6,7 @@ import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 try:
     import winreg
@@ -13,6 +14,7 @@ except ImportError:  # pragma: no cover - Windows only
     winreg = None
 
 from .config import SOFTWARE_ALIASES, SOFTWARE_CATALOG, SoftwarePackage
+from .identity import detect_choco_with_identity, registry_match_with_identity
 from .models import SoftwareState
 
 # Phrase-only registry display matching (substring, lowercased). Avoids "teams" matching "TeamSpeak".
@@ -39,11 +41,23 @@ class PostUninstallVerification:
 
 
 class SoftwareScanner:
-    def __init__(self, choco_client, winget_client, logger, catalog: tuple[SoftwarePackage, ...] | None = None) -> None:
+    def __init__(
+        self,
+        choco_client,
+        winget_client,
+        logger,
+        catalog: tuple[SoftwarePackage, ...] | None = None,
+        software_providers: dict[str, Any] | None = None,
+    ) -> None:
         self.choco = choco_client
         self.winget = winget_client
         self.logger = logger
         self.catalog = catalog or SOFTWARE_CATALOG
+        self._providers: dict[str, Any] = software_providers if isinstance(software_providers, dict) else {}
+
+    def _provider_cfg(self, software: SoftwarePackage) -> dict[str, Any]:
+        raw = self._providers.get(software.key, {})
+        return raw if isinstance(raw, dict) else {}
 
     def scan(self) -> dict[str, SoftwareState]:
         local = self.choco.list_local()
@@ -53,7 +67,7 @@ class SoftwareScanner:
 
         states: dict[str, SoftwareState] = {}
         for software in self.catalog:
-            detected_pkg = self._detect_package_name(software, local)
+            detected_pkg = self._detect_package_name_choco(software, local)
             if detected_pkg:
                 installed_ver = local.get(detected_pkg, "")
                 if detected_pkg in outdated_versions:
@@ -87,7 +101,7 @@ class SoftwareScanner:
                 )
                 continue
 
-            if self._registry_match(software, registry_entries):
+            if self._registry_match(software, registry_entries, self._provider_cfg(software)):
                 states[software.key] = SoftwareState(
                     "Installiert",
                     package_name=None,
@@ -107,23 +121,8 @@ class SoftwareScanner:
             )
         return states
 
-    @staticmethod
-    def _detect_package_name(software: SoftwarePackage, local_packages: dict[str, str]) -> str | None:
-        if software.primary_package and software.primary_package.lower() in local_packages:
-            return software.primary_package.lower()
-
-        aliases = SOFTWARE_ALIASES.get(software.key, ())
-        for term in software.search_terms:
-            term_lower = term.lower()
-            for pkg in local_packages:
-                if term_lower in pkg:
-                    return pkg
-        for alias in aliases:
-            alias_lower = alias.lower()
-            for pkg in local_packages:
-                if alias_lower in pkg:
-                    return pkg
-        return None
+    def _detect_package_name_choco(self, software: SoftwarePackage, local_packages: dict[str, str]) -> str | None:
+        return detect_choco_with_identity(software, local_packages, self._provider_cfg(software))
 
     @staticmethod
     def _registry_phrase_list_matches(lowered: str, phrases: tuple[str, ...]) -> bool:
@@ -140,7 +139,7 @@ class SoftwareScanner:
         return re.search(rf"(?<!\w){re.escape(t)}(?!\w)", lowered, flags=re.IGNORECASE) is not None
 
     @staticmethod
-    def _registry_display_matches(software: SoftwarePackage, display_name: str) -> bool:
+    def _legacy_registry_display_matches(software: SoftwarePackage, display_name: str) -> bool:
         lowered = str(display_name or "").lower()
         if not lowered:
             return False
@@ -153,6 +152,19 @@ class SoftwareScanner:
             if SoftwareScanner._registry_term_matches(term, lowered):
                 return True
         return False
+
+    @staticmethod
+    def _registry_display_matches(
+        software: SoftwarePackage,
+        display_name: str,
+        provider_cfg: dict[str, Any] | None = None,
+    ) -> bool:
+        prov = provider_cfg if isinstance(provider_cfg, dict) else {}
+        lowered = str(display_name or "").lower()
+        im = registry_match_with_identity(software, lowered, prov)
+        if im is not None:
+            return im
+        return SoftwareScanner._legacy_registry_display_matches(software, display_name)
 
     @staticmethod
     def registry_entry_signals_real_install(entry: dict[str, str]) -> bool:
@@ -203,9 +215,9 @@ class SoftwareScanner:
         return False
 
     @staticmethod
-    def _registry_match(software: SoftwarePackage, registry_entries: list[dict[str, str]]) -> bool:
+    def _registry_match(software: SoftwarePackage, registry_entries: list[dict[str, str]], provider_cfg: dict[str, Any]) -> bool:
         for entry in registry_entries:
-            if not SoftwareScanner._registry_display_matches(software, entry.get("display_name", "")):
+            if not SoftwareScanner._registry_display_matches(software, entry.get("display_name", ""), provider_cfg):
                 continue
             if SoftwareScanner.registry_entry_signals_real_install(entry):
                 return True
@@ -220,12 +232,17 @@ class SoftwareScanner:
         stale: list[str] = []
         evidence: list[str] = []
 
-        choco_pkg = self._detect_package_name(software, local)
+        choco_pkg = self._detect_package_name_choco(software, local)
         wg_hit = bool(software.winget_id and software.winget_id.lower() in winget_installed)
         if wg_hit:
             evidence.append(f"WinGet inventory: {software.winget_id}")
 
-        reg_real = [e for e in registry_entries if self._registry_display_matches(software, e.get("display_name", "")) and self.registry_entry_signals_real_install(e)]
+        prov = self._provider_cfg(software)
+        reg_real = [
+            e
+            for e in registry_entries
+            if self._registry_display_matches(software, e.get("display_name", ""), prov) and self.registry_entry_signals_real_install(e)
+        ]
         for e in reg_real[:3]:
             evidence.append(f"ARP/Registry (valid): {e.get('display_name', '')[:80]}")
 

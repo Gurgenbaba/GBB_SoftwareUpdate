@@ -119,7 +119,21 @@ def get_cleanup_config(software_providers: dict[str, Any], software_key: str) ->
     if not isinstance(raw, dict):
         return {}
     c = raw.get("cleanup")
-    return c if isinstance(c, dict) else {}
+    c = c if isinstance(c, dict) else {}
+    paths: list[str] = []
+    for p in c.get("paths") or []:
+        if isinstance(p, str) and p.strip():
+            paths.append(p.strip())
+    ident = raw.get("identity") if isinstance(raw.get("identity"), dict) else {}
+    extra = ident.get("cleanup_paths") if isinstance(ident.get("cleanup_paths"), list) else []
+    for p in extra:
+        if isinstance(p, str) and p.strip() and p.strip() not in paths:
+            paths.append(p.strip())
+    return {
+        "paths": paths,
+        "registry": c.get("registry") if isinstance(c.get("registry"), list) else [],
+        "shortcuts": c.get("shortcuts") if isinstance(c.get("shortcuts"), list) else [],
+    }
 
 
 def _cleanup_config_nonempty(cfg: dict[str, Any]) -> bool:

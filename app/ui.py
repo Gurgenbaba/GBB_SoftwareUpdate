@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import os
 import platform
+import subprocess
 import queue
 import shutil
 import threading
@@ -17,9 +18,11 @@ from PIL import Image, ImageTk
 
 from .choco import ChocoClient
 from .config import APP_DIR, APP_NAME, BUNDLE_DIR, EXE_PARENT, REPORT_DIR, SOFTWARE_BY_KEY, SOFTWARE_CATALOG
+from .enterprise import apply_choco_ghost_cleanup_after_uninstall, try_restore_point_or_registry_export
 from .health import run_self_health_check
 from .installers import InstallerService
 from .local_source import LocalSourceService
+from .office_uninstall import office_removal_tools_available
 from .uninstallers import UninstallerService
 from .winget import WingetService
 from .json_config import (
@@ -32,7 +35,7 @@ from .json_config import (
 )
 from .logger import build_logger
 from .models import ReportEntry, SoftwareState
-from .reporting import ReportWriter, pdf_export_available, write_summary_pdf
+from .reporting import ReportWriter, pdf_export_available, write_html_report, write_summary_pdf
 from .result_normalization import dialog_detail_lines, format_install_summary_lines, format_scan_summary_lines
 from .residue_cleanup import apply_selected_cleanup, run_residue_cleanup_phase
 from .scanner import SoftwareScanner
@@ -64,10 +67,18 @@ class UpdaterApp(ctk.CTk):
         self.logger, self.log_file = build_logger(self._enqueue_log)
         self.runtime = load_runtime_settings(self.logger)
         self.logger.info("Laufzeitkonfiguration: %s", CONFIG_JSON_PATH)
+        if getattr(self.runtime, "dry_run_default", False):
+            self.dry_run_var.set(True)
 
         self.choco = ChocoClient(self.logger)
         self.winget = WingetService(self.logger)
-        self.scanner = SoftwareScanner(self.choco, self.winget, self.logger, self.runtime.visible_catalog)
+        self.scanner = SoftwareScanner(
+            self.choco,
+            self.winget,
+            self.logger,
+            self.runtime.visible_catalog,
+            software_providers=self.runtime.software_providers,
+        )
         self.local_source = LocalSourceService(self.logger, self.runtime.software_providers)
         if self.runtime.local_source_last_path:
             self.local_source.scan_source(self.runtime.local_source_last_path)
@@ -93,6 +104,7 @@ class UpdaterApp(ctk.CTk):
             runtime_by_key,
             scanner=self.scanner,
             software_providers=self.runtime.software_providers,
+            office_tools=self.runtime.office_tools,
         )
         self.report_writer = ReportWriter(self.logger)
         self.system_tools = SystemToolsService(self.logger)
@@ -1094,6 +1106,8 @@ class UpdaterApp(ctk.CTk):
             return "PRUEFT", "#8a6a2a", "#fff8e6"
         if st == "Quelle erforderlich":
             return "QUELLE", "#7a6a2b", "#f5f1e0"
+        if st == "Warnung":
+            return "HINWEIS", "#6b5c38", "#f8f5ed"
         if "fehler" in st.lower():
             return "FEHLER", "#7a3240", "#f8e9ed"
         if "dry-run" in st.lower():
@@ -1775,7 +1789,13 @@ class UpdaterApp(ctk.CTk):
                 self.local_source.scan_source(self.runtime.local_source_last_path)
                 self.local_source_path_var.set(f"Aktive lokale Quelle: {self.runtime.local_source_last_path}")
             runtime_by_key = {s.key: s for s in self.runtime.visible_catalog}
-            self.scanner = SoftwareScanner(self.choco, self.winget, self.logger, self.runtime.visible_catalog)
+            self.scanner = SoftwareScanner(
+                self.choco,
+                self.winget,
+                self.logger,
+                self.runtime.visible_catalog,
+                software_providers=self.runtime.software_providers,
+            )
             self.installer = InstallerService(
                 self.choco,
                 self.winget,
@@ -1797,6 +1817,7 @@ class UpdaterApp(ctk.CTk):
                 runtime_by_key,
                 scanner=self.scanner,
                 software_providers=self.runtime.software_providers,
+                office_tools=self.runtime.office_tools,
             )
             self._apply_title()
             self.company_label.configure(text=f"Company: {self.runtime.company_name or 'Nicht gesetzt'}")
@@ -1989,6 +2010,12 @@ class UpdaterApp(ctk.CTk):
                 self.ui_queue.put(("progress", {"frac": 1.0, "done": total, "total": total}))
                 rows = self.report_writer.from_scan(self.current_states, keys)
                 self.last_report_file = self.report_writer.write_report(rows, "scan_report")
+                html_report_path = ""
+                try:
+                    html_report_path = str(write_html_report(rows, "scan_report", "GBB SoftwareUpdater – Prüfung"))
+                    self.logger.info("HTML-Report: %s", html_report_path)
+                except Exception as exc:  # pylint: disable=broad-except
+                    self.logger.warning("HTML-Report: %s", exc)
                 self.logger.info("Prüfung abgeschlossen.")
                 self._queue_status("Prüfung abgeschlossen.")
                 summary_txt = self._scan_summary_text(rows)
@@ -2000,6 +2027,7 @@ class UpdaterApp(ctk.CTk):
                             "summary": summary_txt,
                             "entries": rows,
                             "report_csv": self.last_report_file,
+                            "html_report": html_report_path,
                             "dry_run": False,
                             "kind": "scan",
                         },
@@ -2034,6 +2062,7 @@ class UpdaterApp(ctk.CTk):
         summary = str(data.get("summary", ""))
         entries = data.get("entries") or []
         report_csv = data.get("report_csv")
+        html_report = str(data.get("html_report") or "").strip()
         kind = str(data.get("kind", "install"))
 
         dialog = ctk.CTkToplevel(self)
@@ -2072,6 +2101,13 @@ class UpdaterApp(ctk.CTk):
                 REPORT_DIR.mkdir(parents=True, exist_ok=True)
                 os.startfile(str(REPORT_DIR))  # type: ignore[attr-defined]
 
+        def open_html_report() -> None:
+            hp = Path(html_report) if html_report else None
+            if hp and hp.exists():
+                os.startfile(str(hp))  # type: ignore[attr-defined]
+            else:
+                messagebox.showinfo(APP_NAME, "Kein HTML-Bericht vorhanden.", parent=dialog)
+
         def export_pdf() -> None:
             if not isinstance(entries, list) or not entries:
                 messagebox.showinfo(APP_NAME, "Keine Zeilen für PDF.")
@@ -2087,6 +2123,10 @@ class UpdaterApp(ctk.CTk):
 
         ctk.CTkButton(btn_row, text="Schliessen", command=close_d).pack(side="left", padx=4)
         ctk.CTkButton(btn_row, text="CSV-Ordner", command=open_csv_dir).pack(side="left", padx=4)
+        html_btn = ctk.CTkButton(btn_row, text="HTML-Bericht", command=open_html_report)
+        html_btn.pack(side="left", padx=4)
+        if not html_report:
+            html_btn.configure(state="disabled")
         pdf_btn = ctk.CTkButton(btn_row, text="PDF exportieren", command=export_pdf)
         pdf_btn.pack(side="left", padx=4)
         if not pdf_export_available():
@@ -2214,6 +2254,75 @@ class UpdaterApp(ctk.CTk):
 
         dialog.protocol("WM_DELETE_WINDOW", on_x)
 
+    def _reboot_pending_blocking_dialog(self) -> str:
+        """Returns 'restart' or 'continue'."""
+        result: dict[str, str] = {"v": "continue"}
+        dlg = ctk.CTkToplevel(self)
+        dlg.title(APP_NAME)
+        dlg.geometry("520x200")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.configure(fg_color=self.ogx_colors["bg"])
+
+        def _finish(val: str) -> None:
+            result["v"] = val
+            dlg.destroy()
+
+        frame = ctk.CTkFrame(dlg, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=16, pady=16)
+        ctk.CTkLabel(
+            frame,
+            text="System benötigt Neustart. Installationen könnten fehlschlagen.",
+            anchor="w",
+            justify="left",
+            wraplength=480,
+        ).pack(fill="x", pady=(0, 14))
+        row = ctk.CTkFrame(frame, fg_color="transparent")
+        row.pack(fill="x")
+        ctk.CTkButton(row, text="Neustart jetzt", width=160, command=lambda: _finish("restart")).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(row, text="Trotzdem fortfahren", width=180, command=lambda: _finish("continue")).pack(side="left")
+        dlg.protocol("WM_DELETE_WINDOW", lambda: _finish("continue"))
+        self.wait_window(dlg)
+        return result["v"]
+
+    def _office_no_managed_tools_removal_dialog(self) -> str:
+        """Returns ``cancel`` (skip Microsoft 365 in this run) or ``try`` (generic uninstall with acknowledgement)."""
+        result: dict[str, str] = {"v": "cancel"}
+        dlg = ctk.CTkToplevel(self)
+        dlg.title(APP_NAME)
+        dlg.geometry("560x320")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.configure(fg_color=self.ogx_colors["bg"])
+
+        def _finish(val: str) -> None:
+            result["v"] = val
+            dlg.destroy()
+
+        frame = ctk.CTkFrame(dlg, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=16, pady=16)
+        ctk.CTkLabel(
+            frame,
+            text=(
+                "Hinweis:\n"
+                "Kein erweitertes Office-Removal-Tool gefunden. Für sauberes Entfernen bitte ODT oder Microsoft Get Help bereitstellen.\n\n"
+                "ODT auf Admin-Share legen und office_tools.odt_setup_path setzen "
+                r"(z.B. \\fileserver\software\OfficeODT\setup.exe)."
+                "\n\n"
+                "Microsoft 365 für diesen Lauf auslassen (empfohlen), oder trotzdem die generische Deinstallation versuchen?"
+            ),
+            anchor="w",
+            justify="left",
+            wraplength=520,
+        ).pack(fill="both", expand=True, pady=(0, 12))
+        row = ctk.CTkFrame(frame, fg_color="transparent")
+        row.pack(fill="x")
+        ctk.CTkButton(row, text="Abbrechen (ohne Office)", width=200, command=lambda: _finish("cancel")).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(row, text="Trotzdem versuchen", width=180, command=lambda: _finish("try")).pack(side="left")
+        dlg.protocol("WM_DELETE_WINDOW", lambda: _finish("cancel"))
+        self.wait_window(dlg)
+        return result["v"]
+
     def _install_selected(self) -> None:
         self._run_action("install")
 
@@ -2236,6 +2345,7 @@ class UpdaterApp(ctk.CTk):
                 APP_NAME,
                 "Diese Programme werden vom System entfernt. Fortfahren?",
             ):
+                self._operation_lock.release()
                 return
         elif not self.dry_run_var.get() and not messagebox.askyesno(
             APP_NAME,
@@ -2244,11 +2354,62 @@ class UpdaterApp(ctk.CTk):
                 self._operation_lock.release()
                 return
 
+        dry = self.dry_run_var.get()
+        if not dry and InstallerService.is_reboot_pending():
+            choice = self._reboot_pending_blocking_dialog()
+            if choice == "restart":
+                self._operation_lock.release()
+                try:
+                    subprocess.run(["shutdown", "/r", "/t", "0"], check=False)
+                except Exception:  # pylint: disable=broad-except
+                    messagebox.showerror(APP_NAME, "Neustart konnte nicht gestartet werden.", parent=self)
+                return
+
+        office_removal_ack_keys: set[str] = set()
+        keys_to_process = list(keys)
+        synthetic_office_tool_missing: ReportEntry | None = None
+        if mode == "remove" and not dry and "office365business" in keys:
+            if not office_removal_tools_available(self.runtime.office_tools, self.logger):
+                choice_office = self._office_no_managed_tools_removal_dialog()
+                if choice_office == "cancel":
+                    keys_to_process = [k for k in keys if k != "office365business"]
+                    prev_o = self.current_states.get("office365business", SoftwareState("Installiert"))
+                    hint = (
+                        "Kein erweitertes Office-Removal-Tool gefunden. "
+                        "Für sauberes Entfernen bitte ODT oder Microsoft Get Help bereitstellen."
+                    )
+                    synthetic_office_tool_missing = ReportEntry(
+                        software_key="office365business",
+                        package_name=prev_o.package_name or "",
+                        status_before=prev_o.status,
+                        action="Entfernen",
+                        status_after="Hinweis: Office-Removal-Tool fehlt",
+                        result="Manuell",
+                        error_message=hint,
+                        manual_reason=hint,
+                        uninstall_method="",
+                        extended_metadata="office_removal_guidance=true",
+                    )
+                    if not keys_to_process:
+                        self._operation_lock.release()
+                        messagebox.showinfo(
+                            APP_NAME,
+                            "Microsoft 365 wurde nicht entfernt (kein Removal-Tool; Vorgang für Office abgebrochen).",
+                            parent=self,
+                        )
+                        return
+                else:
+                    office_removal_ack_keys.add("office365business")
+                    self.logger.info(
+                        "[OFFICE] Hinweis: ODT auf Admin-Share legen (z.B. \\\\fileserver\\software\\OfficeODT\\setup.exe) "
+                        "und office_tools.odt_setup_path in config.json setzen."
+                    )
+
         self._set_actions_enabled(False)
-        self._progress_phase = "bearbeitet"
+        self._progress_phase = "Installation" if mode == "install" else "Deinstallation"
         self.ui_queue.put(("row_progress_reset", keys))
-        total = len(keys)
-        self.ui_queue.put(("progress", {"frac": 0.0, "done": 0, "total": total}))
+        total = len(keys_to_process) if mode == "remove" else len(keys)
+        self.ui_queue.put(("progress", {"frac": 0.0, "done": 0, "total": max(total, 1)}))
         self._queue_status("Vorgang gestartet..." if mode == "install" else "Entfernen gestartet...")
 
         def status_callback(key: str, state: SoftwareState) -> None:
@@ -2285,8 +2446,6 @@ class UpdaterApp(ctk.CTk):
         def resolution_callback(key: str, choco_package: str | None, winget_id: str | None) -> None:
             self.ui_queue.put(("resolved_source", {"key": key, "choco": choco_package, "winget": winget_id}))
 
-        dry = self.dry_run_var.get()
-
         def worker() -> None:
             try:
                 if mode == "install" and "filezilla" in keys:
@@ -2294,12 +2453,8 @@ class UpdaterApp(ctk.CTk):
                         self.logger.info("FileZilla: Installation im Buchhaltungskontext (per Alle Pakete: Ja).")
                     else:
                         self.logger.info("FileZilla: Installation ohne Buchhaltungs-Markierung (manuell oder anderer Auswahlweg).")
-                if mode == "install" and InstallerService.is_reboot_pending():
-                    self.logger.warning("Reboot Pending erkannt: Neustart empfohlen.")
-                    self.ui_queue.put(("hint", "Neustart empfohlen"))
-                    if mandatory:
-                        self.ui_queue.put(("warning", "Neustart empfohlen. Pflichtlauf wird trotzdem fortgesetzt."))
                 if mode in ("install", "remove"):
+                    self.ui_queue.put(("progress_phase", "Hintergrundprüfung"))
                     self._queue_status("Installationsstatus wird aktualisiert...")
                     fresh = self.scanner.scan()
                     self.current_states.update(fresh)
@@ -2331,7 +2486,7 @@ class UpdaterApp(ctk.CTk):
                     )
                     if mode == "install"
                     else self.uninstaller.process(
-                        keys,
+                        keys_to_process,
                         self.current_states,
                         status_callback,
                         progress_callback,
@@ -2340,9 +2495,23 @@ class UpdaterApp(ctk.CTk):
                         scanner=self.scanner,
                         software_providers=self.runtime.software_providers,
                         method_progress_callback=method_progress_callback,
+                        office_removal_generic_ack_keys=office_removal_ack_keys or None,
                     )
                 )
+                if mode == "remove" and synthetic_office_tool_missing is not None:
+                    by_key = {r.software_key: r for r in rows}
+                    merged_rows: list[ReportEntry] = []
+                    for rk in keys:
+                        if rk == "office365business" and rk not in keys_to_process:
+                            merged_rows.append(synthetic_office_tool_missing)
+                        elif rk in by_key:
+                            merged_rows.append(by_key[rk])
+                    rows = merged_rows
                 if mode == "remove" and not dry:
+                    rows = apply_choco_ghost_cleanup_after_uninstall(rows, self.choco, self.logger)
+                    if getattr(self.runtime, "enable_backup", True):
+                        try_restore_point_or_registry_export(self.logger, reports_dir=Path(REPORT_DIR))
+                    self.ui_queue.put(("progress_phase", "Bereinigung"))
                     rows = run_residue_cleanup_phase(
                         rows,
                         self.runtime.software_providers,
@@ -2351,6 +2520,12 @@ class UpdaterApp(ctk.CTk):
                         self.ui_queue,
                     )
                 self.last_report_file = self.report_writer.write_report(rows, "install_report")
+                html_report_path = ""
+                try:
+                    html_report_path = str(write_html_report(rows, "install_report", "GBB SoftwareUpdater – Bericht"))
+                    self.logger.info("HTML-Report: %s", html_report_path)
+                except Exception as exc:  # pylint: disable=broad-except
+                    self.logger.warning("HTML-Report: %s", exc)
                 if mode == "remove" and not dry:
                     self._queue_status("Installationsstatus wird aktualisiert...")
                     fresh_remove = self.scanner.scan()
@@ -2390,6 +2565,7 @@ class UpdaterApp(ctk.CTk):
                             "summary": full_summary,
                             "entries": rows,
                             "report_csv": self.last_report_file,
+                            "html_report": html_report_path,
                             "dry_run": dry,
                             "kind": "install",
                         },
@@ -2601,8 +2777,10 @@ class UpdaterApp(ctk.CTk):
                 self._install_activity_line = f"{dn}: {det}" if dn else det
                 if len(payload) >= 3 and payload[2]:
                     self._progress_phase = str(payload[2])
-                else:
-                    self._progress_phase = "bearbeitet"
+                self._apply_status_line()
+                self._refresh_progress_count_label()
+            elif action == "progress_phase" and isinstance(payload, str):
+                self._progress_phase = str(payload)
                 self._apply_status_line()
                 self._refresh_progress_count_label()
             elif action == "download_progress" and isinstance(payload, dict):

@@ -413,6 +413,7 @@ class InstallerService:
                         uninstall_method="",
                         uninstall_attempts_json="",
                         manual_reason="",
+                        extended_metadata="",
                     )
                 )
 
@@ -569,6 +570,98 @@ class InstallerService:
             ),
         )
 
+    def _effective_choco_native_ui(self, software: SoftwarePackage | None) -> bool:
+        if not software:
+            return bool(getattr(self, "_native_vendor_install_ui", False))
+        if bool(getattr(self, "_native_vendor_install_ui", False)):
+            return True
+        from .enterprise import choco_use_native_installer_ui, parse_install_mode
+
+        cfg = self.provider_configs.get(software.key, {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+        return choco_use_native_installer_ui(
+            install_mode=parse_install_mode(cfg),
+            software_key=software.key,
+            native_ui_keys=NATIVE_VENDOR_INSTALL_UI_KEYS,
+        )
+
+    def _effective_winget_interactive(self, software: SoftwarePackage | None) -> bool:
+        if not software:
+            return bool(getattr(self, "_native_vendor_install_ui", False))
+        if bool(getattr(self, "_native_vendor_install_ui", False)):
+            return True
+        from .enterprise import parse_install_mode, winget_interactive
+
+        cfg = self.provider_configs.get(software.key, {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+        return winget_interactive(
+            install_mode=parse_install_mode(cfg),
+            software_key=software.key,
+            native_ui_keys=NATIVE_VENDOR_INSTALL_UI_KEYS,
+        )
+
+    def _attempt_chain_by_provider_priority(
+        self,
+        software: SoftwarePackage,
+        package_name: str | None,
+        winget_id: str | None,
+        prev: SoftwareState,
+        dry_run: bool,
+        internal_installers: dict[str, dict[str, Any]],
+        *,
+        winget_op: str,
+    ) -> tuple[str, SoftwareState]:
+        from .enterprise import parse_provider_priority
+
+        cfg = self.provider_configs.get(software.key, {})
+        raw = cfg if isinstance(cfg, dict) else {}
+        order = parse_provider_priority(raw, software_key=software.key, prefer_local=self.prefer_local_source)
+        errors: list[str] = []
+        for step in order:
+            if step == "local":
+                local = self._run_local_source_installer(software, prev, dry_run)
+                if local is None:
+                    continue
+                action, state = local
+                if dry_run or state.status != "Fehler":
+                    return action, state
+                errors.append(f"Lokal/USB: {state.detail}")
+            elif step == "choco" and package_name:
+                self.logger.info("Nutze Provider: Chocolatey (Prioritaetskette)")
+                action, state = self._run_choco_upgrade(package_name, prev, dry_run)
+                if dry_run or state.status != "Fehler":
+                    return action, state
+                if software.key == "teamviewer" and self._is_hash_mismatch(state.detail):
+                    self.logger.warning("Chocolatey Hash mismatch, wechsel zu WinGet.")
+                errors.append(f"Chocolatey: {state.detail}")
+            elif step == "winget" and winget_id:
+                self.logger.info("Nutze Provider: WinGet (Prioritaetskette)")
+                if winget_op == "install":
+                    action, state = self._run_winget_install(winget_id, prev, dry_run)
+                else:
+                    action, state = self._run_winget_upgrade(winget_id, prev, dry_run)
+                if dry_run or state.status != "Fehler":
+                    return action, state
+                errors.append(f"WinGet: {state.detail}")
+            elif step == "internal":
+                installer_state = self._run_internal_installer(software, internal_installers, dry_run)
+                if installer_state is None:
+                    continue
+                self.logger.info("Nutze Provider: Intern (Prioritaetskette)")
+                if dry_run and installer_state.status == "Dry-Run (unveraendert)":
+                    tag = "DRY-RUN: wuerde upgraden" if winget_op == "upgrade" else "DRY-RUN: wuerde installieren"
+                    return (tag, installer_state)
+                if installer_state.status not in ("Fehler", "Quelle erforderlich"):
+                    return ("Interner Installer", installer_state)
+                errors.append(f"Intern: {installer_state.detail}")
+                if installer_state.status == "Quelle erforderlich" and not errors:
+                    return ("Quelle erforderlich", installer_state)
+        if not errors:
+            return ("Quelle erforderlich", SoftwareState("Quelle erforderlich", detail="Keine gueltige Quelle gefunden", provider="Quelle erforderlich"))
+        return ("Fehler", SoftwareState("Fehler", detail=" | ".join(errors)[:400], provider="Quelle erforderlich"))
+
     def _attempt_update_chain(
         self,
         software: SoftwarePackage,
@@ -578,6 +671,11 @@ class InstallerService:
         dry_run: bool,
         internal_installers: dict[str, dict[str, Any]],
     ) -> tuple[str, SoftwareState]:
+        raw_cfg = self.provider_configs.get(software.key, {})
+        if isinstance(raw_cfg, dict) and isinstance(raw_cfg.get("provider_priority"), list) and len(raw_cfg["provider_priority"]) > 0:
+            return self._attempt_chain_by_provider_priority(
+                software, package_name, winget_id, prev, dry_run, internal_installers, winget_op="upgrade"
+            )
         errors: list[str] = []
         if self.prefer_local_source:
             local = self._run_local_source_installer(software, prev, dry_run)
@@ -637,6 +735,11 @@ class InstallerService:
         dry_run: bool,
         internal_installers: dict[str, dict[str, Any]],
     ) -> tuple[str, SoftwareState]:
+        raw_cfg = self.provider_configs.get(software.key, {})
+        if isinstance(raw_cfg, dict) and isinstance(raw_cfg.get("provider_priority"), list) and len(raw_cfg["provider_priority"]) > 0:
+            return self._attempt_chain_by_provider_priority(
+                software, package_name, winget_id, prev, dry_run, internal_installers, winget_op="install"
+            )
         errors: list[str] = []
         if self.prefer_local_source:
             local = self._run_local_source_installer(software, prev, dry_run)
@@ -889,7 +992,7 @@ class InstallerService:
         sw = self.software_by_key.get(self._current_software_key)
         if sw:
             self._emit_activity(sw, "Chocolatey (Upgrade) …")
-        native = bool(getattr(self, "_native_vendor_install_ui", False))
+        native = self._effective_choco_native_ui(sw)
         result = self._run_with_retry(package_name, "upgrade", package_name, native_ui=native)
         return ("Upgrade", SoftwareState("Aktuell" if result.ok else "Fehler", package_name=package_name, detail=self._combine_error(result), provider="Chocolatey"))
 
@@ -903,7 +1006,7 @@ class InstallerService:
         sw = self.software_by_key.get(self._current_software_key)
         if sw:
             self._emit_activity(sw, "WinGet (Upgrade) …")
-        interactive = bool(getattr(self, "_native_vendor_install_ui", False))
+        interactive = self._effective_winget_interactive(sw)
         result = self._run_winget_with_lock_retry("upgrade", winget_id, interactive=interactive)
         return ("Upgrade", SoftwareState("Aktuell" if result.ok else "Fehler", package_name=winget_id, detail=self._combine_error(result), provider="WinGet"))
 
@@ -917,7 +1020,7 @@ class InstallerService:
         sw = self.software_by_key.get(self._current_software_key)
         if sw:
             self._emit_activity(sw, "WinGet …")
-        interactive = bool(getattr(self, "_native_vendor_install_ui", False))
+        interactive = self._effective_winget_interactive(sw)
         result = self._run_winget_with_lock_retry("install", winget_id, interactive=interactive)
         return ("Install", SoftwareState("Installiert" if result.ok else "Fehler", package_name=winget_id, detail=self._combine_error(result), provider="WinGet"))
 
