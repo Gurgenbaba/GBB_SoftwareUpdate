@@ -41,14 +41,14 @@ DEFAULT_EXAMPLE_CONFIG: dict[str, Any] = {
     ],
     "internal_installers": {
         "avaya": {
-            "path": r"\\fileserver\software\Avaya\AvayaWorkplaceSetup.exe",
+            "path": "",
             "silent_args": "/S",
             "type": "auto",
             "response_file": "",
             "display_name": "Avaya Workplace",
         },
         "opentext": {
-            "path": r"\\fileserver\software\OpenText\OpenTextSetup.exe",
+            "path": "",
             "silent_args": "/quiet /norestart",
             "type": "auto",
             "response_file": "",
@@ -61,6 +61,7 @@ DEFAULT_EXAMPLE_CONFIG: dict[str, Any] = {
             "response_file": "",
             "display_name": "OpenText Core Endpoint Protection",
             "endpoint_keycode": "",
+            "sha256": "",
         },
     },
     "software_providers": {},
@@ -94,6 +95,17 @@ DEFAULT_EXAMPLE_CONFIG: dict[str, Any] = {
         "display_timeout_seconds": 30,
         "sleep_timeout_minutes": 3,
         "power_profile": "balanced",
+        "dark_mode_enabled": False,
+        "screensaver_disabled": False,
+        "show_battery_percent": False,
+        "ac_lid_action": "none",
+        "dc_lid_action": "sleep",
+        "ac_power_button_action": "sleep",
+        "dc_power_button_action": "sleep",
+        "ac_standby_disabled": False,
+        "dc_standby_disabled": False,
+        "adaptive_brightness_enabled": False,
+        "usb_power_saving_enabled": True,
     },
     "ui_columns": {
         "checkbox": 44,
@@ -249,7 +261,7 @@ def _merge_internal_installers(overrides: Any) -> dict[str, dict[str, Any]]:
         if key not in merged:
             merged[key] = deepcopy(data)
             continue
-        for field in ("path", "silent_args", "type", "response_file", "display_name", "endpoint_keycode"):
+        for field in ("path", "silent_args", "type", "response_file", "display_name", "endpoint_keycode", "sha256"):
             if field in data and data[field] is not None:
                 merged[key][field] = data[field]
     return merged

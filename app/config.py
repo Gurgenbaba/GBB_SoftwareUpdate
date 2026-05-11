@@ -44,8 +44,10 @@ INSTALLER_VERIFY_AFTER_TIMEOUT = True
 INSTALLER_VERIFY_POLL_INTERVAL_SECONDS = 10
 INSTALLER_VERIFY_POLL_MAX_SECONDS = 180
 
-AVAYA_INSTALLER_SOURCE = r"\\fileserver\software\Avaya\AvayaWorkplaceSetup.exe"
-OPENTEXT_INSTALLER_SOURCE = r"\\fileserver\software\OpenText\OpenTextSetup.exe"
+# Default paths are intentionally empty so the app does not ship hardcoded server names.
+# Configure real paths (UNC or URL) under internal_installers in config.json.
+AVAYA_INSTALLER_SOURCE = ""
+OPENTEXT_INSTALLER_SOURCE = ""
 # OpenText Core Endpoint Protection (Webroot): generischer Agent-Download; Site-Keycode = Dateiname laut Hersteller.
 OPENTEXT_ENDPOINT_INSTALLER_URL = "https://anywhere.webrootcloudav.com/zerol/wsasme.exe"
 # Legacy (Windows XP/2003): https://anywhere.webrootcloudav.com/zerol/wsasmefnl.exe
@@ -70,6 +72,7 @@ INTERNAL_INSTALLERS = {
         "response_file": "",
         "display_name": "OpenText Core Endpoint Protection",
         "endpoint_keycode": "",
+        "sha256": "",
     },
 }
 

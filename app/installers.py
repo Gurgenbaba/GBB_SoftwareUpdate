@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import fnmatch
+import hashlib
 import io
 import os
 import re
@@ -45,8 +46,17 @@ LOCK_PROCESS_GLOBS = (
     "acrobat*.exe",
     "reader*.exe",
     "adobe*.exe",
-    "teams*.exe",
     "ccmsetup.exe",
+)
+
+LOCK_TEAMS_EXE_NAMES = frozenset(
+    {
+        "teams.exe",
+        "ms-teams.exe",
+        "msteams.exe",
+        "teams_autoupdate.exe",
+        "teamsupdatemanager.exe",
+    }
 )
 
 NATIVE_VENDOR_INSTALL_UI_KEYS = frozenset({"adobe_reader"})
@@ -684,13 +694,6 @@ class InstallerService:
                 if dry_run or state.status != "Fehler":
                     return action, state
                 errors.append(f"Lokal/USB: {state.detail}")
-        if self.prefer_local_source:
-            local = self._run_local_source_installer(software, prev, dry_run)
-            if local is not None:
-                action, state = local
-                if dry_run or state.status != "Fehler":
-                    return action, state
-                errors.append(f"Lokal/USB: {state.detail}")
         if package_name:
             self.logger.info("Nutze Provider: Chocolatey")
             action, state = self._run_choco_upgrade(package_name, prev, dry_run)
@@ -1153,6 +1156,25 @@ class InstallerService:
                 downloaded_file = self._download_installer_from_url(source_text, report_progress=True)
                 cmd_source = downloaded_file
                 self.logger.info("%s Installer aus URL geladen: %s", software.display_name, source_text)
+                expected_sha256 = internal_info.sha256
+                if not expected_sha256:
+                    self.logger.warning(
+                        "[SECURITY] Kein SHA256 konfiguriert fuer Download-Installer: %s", source_text
+                    )
+                elif not self.verify_file_sha256(downloaded_file, expected_sha256):
+                    self.logger.error(
+                        "[SECURITY] SHA256-Pruefung fehlgeschlagen fuer %s (erwartet: %s…)",
+                        source_text,
+                        expected_sha256[:16],
+                    )
+                    Path(downloaded_file).unlink(missing_ok=True)
+                    return SoftwareState(
+                        "Quelle erforderlich",
+                        detail=f"SHA256-Pruefung fehlgeschlagen – Installer abgelehnt: {source_text}",
+                        installed_version="—",
+                        available_version="—",
+                        provider="Quelle erforderlich",
+                    )
             except Exception as exc:  # pylint: disable=broad-except
                 self.logger.error("Download fehlgeschlagen fuer %s: %s", software.display_name, exc)
                 return SoftwareState("Quelle erforderlich", detail=source_text, installed_version="—", available_version="—", provider="Quelle erforderlich")
@@ -1464,18 +1486,24 @@ class InstallerService:
         sub_kw = self._subprocess_hidden_kwargs() if hide_window else {}
         completed = subprocess.run(
             cmd,
+            capture_output=True,
+            text=True,
             check=False,
             timeout=INSTALL_TIMEOUT_SECONDS,
             shell=False,
             **sub_kw,
         )
         for _ in range(max(INSTALLER_LOCK_MAX_ATTEMPTS - 1, 0)):
-            if not self._is_installer_lock_result(completed.returncode, "", "", timed_out=False):
+            stdout = (completed.stdout or "").strip()
+            stderr = (completed.stderr or "").strip()
+            if not self._is_installer_lock_result(completed.returncode, stdout, stderr, timed_out=False):
                 return completed
             self.logger.warning("Installer-Lock erkannt, warte auf laufende Installation...")
             time.sleep(INSTALLER_LOCK_WAIT_SECONDS)
             completed = subprocess.run(
                 cmd,
+                capture_output=True,
+                text=True,
                 check=False,
                 timeout=INSTALL_TIMEOUT_SECONDS,
                 shell=False,
@@ -1491,6 +1519,15 @@ class InstallerService:
             return ["msiexec", "/i", cmd_source, "/qn", "/norestart", *extra_args]
         return [cmd_source, *extra_args] if extra_args else [cmd_source]
 
+    @staticmethod
+    def verify_file_sha256(path: str, expected: str) -> bool:
+        """Return True iff the file at path matches the expected lowercase hex SHA-256 digest."""
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest().lower() == expected.strip().lower()
+
     class _InternalInstallerInfo:
         def __init__(
             self,
@@ -1499,12 +1536,14 @@ class InstallerService:
             installer_type: str,
             response_file: str,
             endpoint_keycode: str = "",
+            sha256: str = "",
         ) -> None:
             self.source = source
             self.silent_args = silent_args
             self.installer_type = installer_type
             self.response_file = response_file
             self.endpoint_keycode = endpoint_keycode
+            self.sha256 = sha256
 
     @staticmethod
     def _endpoint_keycode_exe_basename(keycode: str) -> str | None:
@@ -1536,6 +1575,7 @@ class InstallerService:
         pc = pc_raw if isinstance(pc_raw, dict) else {}
         pc_int = pc.get("internal_installer", {})
         pc_int = pc_int if isinstance(pc_int, dict) else {}
+        sha256 = ""
         if software.internal_installer_key and software.internal_installer_key in internal_installers:
             internal = internal_installers[software.internal_installer_key]
             source = internal.get("path", source)
@@ -1543,9 +1583,12 @@ class InstallerService:
             installer_type = str(internal.get("type", "auto") or "auto").strip().lower()
             response_file = str(internal.get("response_file", "") or "").strip()
             endpoint_keycode = str(internal.get("endpoint_keycode", "") or "").strip()
+            sha256 = str(internal.get("sha256", "") or "").strip()
         if str(pc_int.get("endpoint_keycode", "") or "").strip():
             endpoint_keycode = str(pc_int.get("endpoint_keycode", "") or "").strip()
-        return InstallerService._InternalInstallerInfo(source, silent_args, installer_type, response_file, endpoint_keycode)
+        if str(pc_int.get("sha256", "") or "").strip():
+            sha256 = str(pc_int.get("sha256", "") or "").strip()
+        return InstallerService._InternalInstallerInfo(source, silent_args, installer_type, response_file, endpoint_keycode, sha256)
 
     def _run_opentext_configure_step(self, installer_source: str, response_file: str) -> None:
         response_path = Path(response_file)
@@ -1565,21 +1608,48 @@ class InstallerService:
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.warning("OpenText Configure-Schritt fehlgeschlagen: %s", exc)
 
+    @staticmethod
+    def _extract_installer_host(source: str) -> str | None:
+        """Return server hostname from a UNC path (\\\\server\\...) or HTTP(S) URL; None otherwise."""
+        s = (source or "").strip()
+        if s.startswith("\\\\"):
+            parts = s.lstrip("\\").split("\\")
+            host = parts[0].strip() if parts else ""
+            return host or None
+        parsed = urllib.parse.urlparse(s)
+        if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+            return parsed.netloc.split(":")[0] or None
+        return None
+
     def _log_opentext_preflight(self, source: str, response_file: str) -> None:
         source_exists = self._is_url_source(source) or Path(source).exists()
         response_exists = True if not response_file else Path(response_file).exists()
         admin_ok = self._is_admin()
-        ports = self._check_ldap_ports()
-        self.logger.info(
-            "OpenText Preflight: installer=%s, response_file=%s, admin=%s, port389=%s, port636=%s",
-            "ok" if source_exists else "fehlt",
-            "ok" if response_exists else "fehlt",
-            "ja" if admin_ok else "nein",
-            "ok" if ports[389] else "warnung",
-            "ok" if ports[636] else "warnung",
-        )
-        if not ports[389] or not ports[636]:
-            self.logger.warning("OpenText Preflight Warnung: Ports 389/636 pruefen (LDAP/LDAPS Erreichbarkeit).")
+        ldap_host = self._extract_installer_host(source)
+        if ldap_host:
+            ports = self._check_ldap_ports(ldap_host)
+            self.logger.info(
+                "OpenText Preflight: installer=%s, response_file=%s, admin=%s, ldap_host=%s, port389=%s, port636=%s",
+                "ok" if source_exists else "fehlt",
+                "ok" if response_exists else "fehlt",
+                "ja" if admin_ok else "nein",
+                ldap_host,
+                "ok" if ports[389] else "warnung",
+                "ok" if ports[636] else "warnung",
+            )
+            if not ports[389] or not ports[636]:
+                self.logger.warning(
+                    "OpenText Preflight Warnung: Ports 389/636 pruefen (LDAP/LDAPS Erreichbarkeit fuer %s).",
+                    ldap_host,
+                )
+        else:
+            self.logger.info(
+                "OpenText Preflight: installer=%s, response_file=%s, admin=%s",
+                "ok" if source_exists else "fehlt",
+                "ok" if response_exists else "fehlt",
+                "ja" if admin_ok else "nein",
+            )
+            self.logger.info("LDAP-Host nicht konfigurierbar aus Quelle; LDAP-Port-Check uebersprungen.")
 
     @staticmethod
     def _is_admin() -> bool:
@@ -1589,11 +1659,11 @@ class InstallerService:
             return False
 
     @staticmethod
-    def _check_ldap_ports() -> dict[int, bool]:
+    def _check_ldap_ports(host: str) -> dict[int, bool]:
         results = {389: False, 636: False}
         for port in (389, 636):
             try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.4):
+                with socket.create_connection((host, port), timeout=0.4):
                     results[port] = True
             except OSError:
                 results[port] = False
@@ -1724,7 +1794,7 @@ class InstallerService:
         for pat in LOCK_PROCESS_GLOBS:
             if fnmatch.fnmatch(n, pat.lower()):
                 return True
-        if "teams" in n and n.endswith(".exe"):
+        if n in LOCK_TEAMS_EXE_NAMES:
             return True
         return False
 

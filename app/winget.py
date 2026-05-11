@@ -105,6 +105,10 @@ class WingetService:
         )
         cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]
         rendered = " ".join(shlex.quote(part) for part in cmd)
+        self.logger.warning(
+            "[SECURITY] WinGet-Bootstrap hat keine konfigurierte SHA256-Verifizierung; "
+            "Herkunft: https://aka.ms/getwinget"
+        )
         self.logger.info("WinGet fehlt, starte Bootstrap: %s", rendered)
         try:
             completed = subprocess.run(
