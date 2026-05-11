@@ -90,6 +90,24 @@ DEFAULT_EXAMPLE_CONFIG: dict[str, Any] = {
         "verify_poll_interval_seconds": 10,
         "verify_poll_max_seconds": 180,
     },
+    "system_settings": {
+        "display_timeout_seconds": 30,
+        "sleep_timeout_minutes": 3,
+        "power_profile": "balanced",
+    },
+    "ui_columns": {
+        "checkbox": 44,
+        "program": 280,
+        "status": 120,
+        "provider": 140,
+        "installed": 120,
+        "available": 120,
+        "progress": 160,
+    },
+    "battery_health": {
+        "desired_charge_limit_percent": 80,
+        "allow_vendor_tools": False,
+    },
 }
 
 

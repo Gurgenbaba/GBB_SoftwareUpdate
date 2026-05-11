@@ -39,6 +39,32 @@ from .reporting import ReportWriter, pdf_export_available, write_html_report, wr
 from .result_normalization import dialog_detail_lines, format_install_summary_lines, format_scan_summary_lines
 from .residue_cleanup import apply_selected_cleanup, run_residue_cleanup_phase
 from .scanner import SoftwareScanner
+from .system_settings import (
+    BatteryChargeCapability,
+    DEFAULT_UI_COLUMNS,
+    MIN_UI_COLUMNS,
+    SettingState,
+    UI_COLUMN_KEYS,
+    ToggleReadResult,
+    apply_show_battery_percent_state,
+    apply_screensaver_state,
+    format_energy_status_rows,
+    merge_ui_columns,
+    read_battery_charge_limit_capability,
+    read_battery_percent,
+    read_battery_saver_state,
+    read_dark_mode,
+    read_display_timeout,
+    read_lid_close_action,
+    read_power_button_action,
+    read_power_mode_ac_dc,
+    read_screensaver_state,
+    read_show_battery_percent_state,
+    read_sleep_timeout,
+    read_adaptive_brightness_state,
+    read_usb_power_saving_state,
+    apply_dark_mode,
+)
 from .system_tools import SystemActionResult, SystemToolsService
 
 
@@ -170,6 +196,7 @@ class UpdaterApp(ctk.CTk):
         self.install_choco_btn: ctk.CTkButton | None = None
         self.install_winget_btn: ctk.CTkButton | None = None
         self.energy_screensaver_btn: ctk.CTkButton | None = None
+        self.device_settings_btn: ctk.CTkButton | None = None
         self._toolbar_buttons: list[ctk.CTkButton] = []
         self._toolbar_cols: int | None = None
         self._filter_heading: ctk.CTkLabel | None = None
@@ -182,11 +209,22 @@ class UpdaterApp(ctk.CTk):
         self._log_wide_split_active: bool | None = None
         self._history_expanded = False
         self._layout_warmup_tries = 0
+        self._ui_column_widths: dict[str, int] = merge_ui_columns(get_config_dict(self.logger).get("ui_columns"))
+        self._col_resize_drag: tuple[str, str, int] | None = None
+        self._system_settings_win: ctk.CTkToplevel | None = None
+        self._energy_value_labels: dict[str, ctk.CTkLabel] = {}
+        self._energy_status_pills: dict[str, ctk.CTkLabel] = {}
+        self._energy_action_buttons: dict[str, ctk.CTkButton] = {}
+        self._battery_guidance_label: ctk.CTkLabel | None = None
+        self.program_name_labels: dict[str, ctk.CTkLabel] = {}
+        self.checkbox_widgets: dict[str, ctk.CTkCheckBox] = {}
+        self._header_grip_widgets: list[ctk.CTkFrame] = []
 
         self._ensure_runtime_catalog()
         self._apply_title()
         self._build_layout()
         self._apply_ogx_style(self)
+        self._style_special_action_buttons()
         self.bind("<Configure>", self._on_window_resize, add="+")
         self.bind_all("<MouseWheel>", self._on_global_mousewheel, add="+")
         self._poll_queues()
@@ -486,33 +524,56 @@ class UpdaterApp(ctk.CTk):
         software_frame.grid_columnconfigure(0, weight=1)
         self._setup_scrollableframe_mousewheel(software_frame)
 
+        col_tool = ctk.CTkFrame(software_frame, fg_color="transparent")
+        col_tool.grid(row=0, column=0, sticky="ew", padx=2, pady=(0, 2))
+        col_tool.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(col_tool, text="Tabellenspalten", font=ctk.CTkFont(size=10, weight="bold")).grid(row=0, column=0, sticky="w")
+        reset_cols = ctk.CTkButton(
+            col_tool,
+            text="Spalten: Standard",
+            width=118,
+            height=20,
+            font=ctk.CTkFont(size=10),
+            command=self._reset_ui_columns_to_defaults,
+        )
+        reset_cols.grid(row=0, column=1, sticky="e")
+        self._attach_tooltip(reset_cols, "Setzt alle Spaltenbreiten auf die Standardwerte aus der Konfiguration.")
+
         header = ctk.CTkFrame(software_frame, fg_color="transparent")
         self.software_header_frame = header
-        header.grid(row=0, column=0, columnspan=7, sticky="ew", padx=2, pady=(0, 2))
-        header.grid_columnconfigure(0, weight=3, minsize=130)
-        header.grid_columnconfigure(1, weight=1, minsize=60)
-        header.grid_columnconfigure(2, weight=1, minsize=60)
-        header.grid_columnconfigure(3, weight=1, minsize=60)
-        header.grid_columnconfigure(4, weight=1, minsize=60)
-        header.grid_columnconfigure(5, weight=1, minsize=76)
+        header.grid(row=1, column=0, sticky="ew", padx=2, pady=(0, 2))
+        self._header_grip_widgets.clear()
         _hf = ctk.CTkFont(size=10, weight="bold")
-        ctk.CTkLabel(header, text="Programm", font=_hf).grid(row=0, column=0, sticky="w", padx=4)
-        ctk.CTkLabel(header, text="Status", font=_hf).grid(row=0, column=1, padx=2)
-        ctk.CTkLabel(header, text="Provider", font=_hf).grid(row=0, column=2, padx=2)
-        ctk.CTkLabel(header, text="Installiert", font=_hf).grid(row=0, column=3, padx=2)
-        ctk.CTkLabel(header, text="Verfuegbar", font=_hf).grid(row=0, column=4, padx=2)
-        ctk.CTkLabel(header, text="Fortschritt", font=_hf).grid(row=0, column=5, padx=2)
+        _titles = ("", "Programm", "Status", "Provider", "Installiert", "Verfuegbar", "Fortschritt")
+        for col in range(7):
+            cell = ctk.CTkFrame(header, fg_color="transparent")
+            cell.grid(row=0, column=col, sticky="nsew", padx=0, pady=0)
+            cell.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(cell, text=_titles[col], font=_hf, anchor="w").grid(row=0, column=0, sticky="w", padx=(4, 0))
+            if col < 6:
+                left_key = UI_COLUMN_KEYS[col]
+                right_key = UI_COLUMN_KEYS[col + 1]
+                grip = ctk.CTkFrame(cell, width=8, height=18, fg_color=self.ogx_colors["border"], corner_radius=2)
+                grip.grid(row=0, column=1, sticky="ns", padx=(2, 0))
+                self._header_grip_widgets.append(grip)
+                grip.bind("<ButtonPress-1>", lambda e, lk=left_key, rk=right_key: self._on_column_resize_start(e, lk, rk))
+                grip.bind("<B1-Motion>", lambda e, lk=left_key, rk=right_key: self._on_column_resize_motion(e, lk, rk))
+                grip.bind("<ButtonRelease-1>", lambda _e: self._on_column_resize_end())
+                grip.bind("<Double-Button-1>", lambda _e, lk=left_key: self._reset_one_column_width(lk))
+                grip.bind("<Enter>", lambda _e, w=grip: w.configure(fg_color=self.ogx_colors["accent"]))
+                grip.bind("<Leave>", lambda _e, w=grip: w.configure(fg_color=self.ogx_colors["border"]))
+                try:
+                    grip.configure(cursor="sb_h_double_arrow")
+                except Exception:
+                    pass
 
-        for idx, software in enumerate(self.runtime.visible_catalog, start=1):
+        for idx, software in enumerate(self.runtime.visible_catalog, start=2):
             key = software.key
             rowf = ctk.CTkFrame(software_frame, fg_color="transparent")
-            rowf.grid(row=idx, column=0, columnspan=7, sticky="ew", pady=1)
-            rowf.grid_columnconfigure(0, weight=3, minsize=130)
-            rowf.grid_columnconfigure(1, weight=1, minsize=60)
-            rowf.grid_columnconfigure(2, weight=1, minsize=60)
-            rowf.grid_columnconfigure(3, weight=1, minsize=60)
-            rowf.grid_columnconfigure(4, weight=1, minsize=60)
-            rowf.grid_columnconfigure(5, weight=1, minsize=76)
+            rowf.grid(row=idx, column=0, sticky="ew", pady=1)
+            for c in range(7):
+                rowf.grid_columnconfigure(c, weight=0, minsize=self._ui_column_widths[UI_COLUMN_KEYS[c]])
+            rowf.grid_columnconfigure(1, weight=1)
             self.row_frames[key] = rowf
             self._setup_scroll_hover_target(rowf, self._software_list_wheel)
 
@@ -525,28 +586,41 @@ class UpdaterApp(ctk.CTk):
                 if key == "opentext_core_endpoint"
                 else software.display_name
             )
-            ctk.CTkCheckBox(rowf, text=row_name, variable=var, width=180, font=ctk.CTkFont(size=10)).grid(
-                row=0, column=0, sticky="w", padx=2, pady=0
+            cb_w = self._ui_column_widths["checkbox"]
+            cb = ctk.CTkCheckBox(
+                rowf,
+                text="",
+                variable=var,
+                width=max(28, cb_w - 8),
+                checkbox_width=16,
+                checkbox_height=16,
+                font=ctk.CTkFont(size=10),
             )
+            cb.grid(row=0, column=0, sticky="w", padx=2, pady=0)
+            self.checkbox_widgets[key] = cb
 
-            badge = ctk.CTkLabel(rowf, text="OFFEN", width=92, height=20, corner_radius=5, anchor="center", font=ctk.CTkFont(size=10))
-            badge.grid(row=0, column=1, padx=2, pady=0)
+            nm = ctk.CTkLabel(rowf, text=row_name, anchor="w", font=ctk.CTkFont(size=10))
+            nm.grid(row=0, column=1, sticky="ew", padx=2, pady=0)
+            self.program_name_labels[key] = nm
+
+            badge = ctk.CTkLabel(rowf, text="OFFEN", height=20, corner_radius=5, anchor="center", font=ctk.CTkFont(size=10))
+            badge.grid(row=0, column=2, padx=2, pady=0, sticky="ew")
             self.badge_labels[key] = badge
 
-            pv = ctk.CTkLabel(rowf, text="—", width=96, anchor="w", font=ctk.CTkFont(size=10))
-            pv.grid(row=0, column=2, padx=2, pady=0)
+            pv = ctk.CTkLabel(rowf, text="—", anchor="w", font=ctk.CTkFont(size=10))
+            pv.grid(row=0, column=3, padx=2, pady=0, sticky="ew")
             self.provider_labels[key] = pv
 
-            vi = ctk.CTkLabel(rowf, text="—", width=88, anchor="w", font=ctk.CTkFont(size=10))
-            vi.grid(row=0, column=3, padx=2, pady=0)
+            vi = ctk.CTkLabel(rowf, text="—", anchor="w", font=ctk.CTkFont(size=10))
+            vi.grid(row=0, column=4, padx=2, pady=0, sticky="ew")
             self.ver_inst_labels[key] = vi
 
-            va = ctk.CTkLabel(rowf, text="—", width=88, anchor="w", font=ctk.CTkFont(size=10))
-            va.grid(row=0, column=4, padx=2, pady=0)
+            va = ctk.CTkLabel(rowf, text="—", anchor="w", font=ctk.CTkFont(size=10))
+            va.grid(row=0, column=5, padx=2, pady=0, sticky="ew")
             self.ver_avail_labels[key] = va
 
-            pb = ctk.CTkProgressBar(rowf, width=100)
-            pb.grid(row=0, column=5, padx=2, pady=0)
+            pb = ctk.CTkProgressBar(rowf, height=12)
+            pb.grid(row=0, column=6, padx=2, pady=0, sticky="ew")
             pb.set(0)
             self.row_progress_bars[key] = pb
 
@@ -555,6 +629,7 @@ class UpdaterApp(ctk.CTk):
             self.current_states[key] = init_state
             self._apply_row_state(key, init_state)
 
+        self._apply_software_column_widths()
         self.search_var.trace_add("write", lambda *_: self._on_search_change())
         self._sync_row_visibility()
 
@@ -614,7 +689,7 @@ class UpdaterApp(ctk.CTk):
         self.energy_screensaver_btn = ctk.CTkButton(
             button_frame,
             text="Energie & Bildschirmschoner",
-            command=self._apply_energy_screensaver_defaults,
+            command=self._open_system_settings_dialog,
             **_btn_kw,
         )
         self.energy_screensaver_btn.grid(row=3, column=2, padx=2, pady=(0, 1), sticky="ew")
@@ -622,6 +697,17 @@ class UpdaterApp(ctk.CTk):
             self.energy_screensaver_btn,
             "Deckel zu = keine Aktion, Standby aus, Bildschirmschoner 15 Min. "
             "Energie: aktives Schema (powercfg); Schoner: aktueller Benutzer. Admin oft nötig.",
+        )
+        self.device_settings_btn = ctk.CTkButton(
+            button_frame,
+            text="Geräte-Einstellungen",
+            command=self._open_system_settings_dialog,
+            **_btn_kw,
+        )
+        self.device_settings_btn.grid(row=3, column=3, padx=2, pady=(0, 1), sticky="ew")
+        self._attach_tooltip(
+            self.device_settings_btn,
+            "Öffnet dieselbe Energie-Übersicht (Alternative Schnelltaste).",
         )
         self.install_choco_btn = ctk.CTkButton(
             button_frame, text="Chocolatey installieren", command=self._bootstrap_chocolatey, **_btn_kw
@@ -653,11 +739,13 @@ class UpdaterApp(ctk.CTk):
             self.patch_run_btn,
             self.system_tools_btn,
             self.energy_screensaver_btn,
+            self.device_settings_btn,
             self.install_choco_btn,
             self.install_winget_btn,
         ]
         if platform.system() != "Windows":
             self.energy_screensaver_btn.configure(state="disabled")
+            self.device_settings_btn.configure(state="disabled")
 
         self.log_box = ctk.CTkTextbox(log_frame, wrap="word", font=ctk.CTkFont(size=10))
         self.log_box.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
@@ -893,34 +981,122 @@ class UpdaterApp(ctk.CTk):
             self.top_frame.grid_columnconfigure(2, weight=1, minsize=300)
 
     def _apply_software_column_layout(self, width: int) -> None:
-        if width >= 1900:
-            col0, other, progress = 400, 118, 164
-        elif width >= 1600:
-            col0, other, progress = 340, 104, 148
-        elif width >= 1300:
-            col0, other, progress = 300, 92, 132
-        elif width >= 1100:
-            col0, other, progress = 260, 82, 118
-        elif width >= 900:
-            col0, other, progress = 220, 72, 104
-        elif width >= 700:
-            col0, other, progress = 190, 64, 92
-        elif width >= 520:
-            col0, other, progress = 165, 56, 80
-        else:
-            col0, other, progress = 120, 48, 68
+        """Horizontal layout reacts to window size; column min widths come from config (ui_columns)."""
+        _ = width
+        self._fit_columns_to_available_width()
+        self._apply_software_column_widths()
 
-        targets: list[ctk.CTkFrame] = []
-        if self.software_header_frame is not None:
-            targets.append(self.software_header_frame)
-        targets.extend(self.row_frames.values())
-        for frame in targets:
-            frame.grid_columnconfigure(0, weight=3, minsize=col0)
-            frame.grid_columnconfigure(1, weight=1, minsize=other)
-            frame.grid_columnconfigure(2, weight=1, minsize=other)
-            frame.grid_columnconfigure(3, weight=1, minsize=other)
-            frame.grid_columnconfigure(4, weight=1, minsize=other)
-            frame.grid_columnconfigure(5, weight=1, minsize=progress)
+    def _apply_software_column_widths(self) -> None:
+        wmap = self._ui_column_widths
+        header = self.software_header_frame
+        if header is not None:
+            for c, key in enumerate(UI_COLUMN_KEYS):
+                header.grid_columnconfigure(c, weight=0, minsize=wmap[key])
+            header.grid_columnconfigure(1, weight=1)
+        for frame in self.row_frames.values():
+            for c, key in enumerate(UI_COLUMN_KEYS):
+                frame.grid_columnconfigure(c, weight=0, minsize=wmap[key])
+            frame.grid_columnconfigure(1, weight=1)
+        cb_w = wmap["checkbox"]
+        for key, cb in self.checkbox_widgets.items():
+            try:
+                cb.configure(width=max(28, cb_w - 8))
+            except Exception:
+                pass
+        wrap_prog = max(120, wmap.get("program", 200) * 4)
+        for lb in self.program_name_labels.values():
+            try:
+                lb.configure(wraplength=wrap_prog)
+            except Exception:
+                pass
+
+    def _total_column_width(self) -> int:
+        return sum(int(self._ui_column_widths.get(k, 0)) for k in UI_COLUMN_KEYS)
+
+    def _fit_columns_to_available_width(self) -> None:
+        if self.software_list_frame is None:
+            return
+        canvas = getattr(self.software_list_frame, "_parent_canvas", None)
+        if canvas is None:
+            return
+        try:
+            avail = int(canvas.winfo_width()) - 18
+        except Exception:
+            return
+        if avail < 320:
+            return
+        total = self._total_column_width()
+        if total <= avail:
+            return
+        over = total - avail
+        # Shrink neutral columns first, keep progress adjustable and not locked by scrollbar.
+        order = ("program", "provider", "installed", "available", "status", "progress", "checkbox")
+        for key in order:
+            if over <= 0:
+                break
+            cur = int(self._ui_column_widths[key])
+            lo = int(MIN_UI_COLUMNS[key])
+            room = max(0, cur - lo)
+            if room <= 0:
+                continue
+            take = min(room, over)
+            self._ui_column_widths[key] = cur - take
+            over -= take
+
+    def _on_column_resize_start(self, event: object, left_key: str, right_key: str) -> None:
+        self._col_resize_drag = (left_key, right_key, int(getattr(event, "x_root", 0)))
+
+    def _on_column_resize_motion(self, event: object, left_key: str, right_key: str) -> None:
+        drag = self._col_resize_drag
+        if drag is None or drag[0] != left_key or drag[1] != right_key:
+            return
+        x0 = drag[2]
+        cur = int(getattr(event, "x_root", x0))
+        delta = cur - x0
+        if delta == 0:
+            return
+        self._col_resize_drag = (left_key, right_key, cur)
+        lo_l = MIN_UI_COLUMNS[left_key]
+        lo_r = MIN_UI_COLUMNS[right_key]
+        wl = self._ui_column_widths[left_key]
+        wr = self._ui_column_widths[right_key]
+        new_l = wl + delta
+        new_r = wr - delta
+        if new_l < lo_l:
+            shift = lo_l - new_l
+            new_l = lo_l
+            new_r = wr - (delta - shift)
+        if new_r < lo_r:
+            shift = new_r - lo_r
+            new_r = lo_r
+            new_l = wl + (delta + shift)
+        new_l = max(lo_l, new_l)
+        new_r = max(lo_r, new_r)
+        self._ui_column_widths[left_key] = int(new_l)
+        self._ui_column_widths[right_key] = int(new_r)
+        self._fit_columns_to_available_width()
+        self._apply_software_column_widths()
+
+    def _on_column_resize_end(self) -> None:
+        if self._col_resize_drag is not None:
+            self._col_resize_drag = None
+            try:
+                cfg = get_config_dict(self.logger)
+                cfg["ui_columns"] = {k: int(self._ui_column_widths[k]) for k in UI_COLUMN_KEYS}
+                save_config_dict(cfg, self.logger)
+            except Exception as exc:  # pylint: disable=broad-except
+                self.logger.warning("ui_columns speichern fehlgeschlagen: %s", exc)
+
+    def _reset_one_column_width(self, key: str) -> None:
+        self._ui_column_widths[key] = int(DEFAULT_UI_COLUMNS[key])
+        self._apply_software_column_widths()
+        self._on_column_resize_end()
+
+    def _reset_ui_columns_to_defaults(self) -> None:
+        self._ui_column_widths = {k: int(DEFAULT_UI_COLUMNS[k]) for k in UI_COLUMN_KEYS}
+        self._fit_columns_to_available_width()
+        self._apply_software_column_widths()
+        self._on_column_resize_end()
 
     def _update_wrap_lengths(self, width: int) -> None:
         health_wrap = max(180, min(1500, width - 48))
@@ -936,6 +1112,12 @@ class UpdaterApp(ctk.CTk):
             self.quick_panel_label.configure(wraplength=info_wrap)
         if self.local_source_path_label is not None:
             self.local_source_path_label.configure(wraplength=source_wrap)
+        wrap_prog = max(120, int(self._ui_column_widths.get("program", 220) * 4))
+        for lb in self.program_name_labels.values():
+            try:
+                lb.configure(wraplength=wrap_prog)
+            except Exception:
+                pass
 
     def _set_history_details_visible(self, visible: bool) -> None:
         if self.history_scroll is not None:
@@ -952,6 +1134,20 @@ class UpdaterApp(ctk.CTk):
             self._set_history_details_visible(False)
             return
         self._set_history_details_visible(self._history_expanded)
+
+    def _style_special_action_buttons(self) -> None:
+        if self.energy_screensaver_btn is not None:
+            self.energy_screensaver_btn.configure(
+                fg_color="#2f7d4f",
+                hover_color="#25643f",
+                text_color="#e8fff0",
+            )
+        if self.system_tools_btn is not None:
+            self.system_tools_btn.configure(
+                fg_color="#8a2d3f",
+                hover_color="#6f2432",
+                text_color="#ffeef2",
+            )
 
     def _set_health_details_visible(self, visible: bool) -> None:
         if self.health_summary_frame is not None:
@@ -1304,6 +1500,221 @@ class UpdaterApp(ctk.CTk):
                 messagebox.showwarning(APP_NAME, detail or "Fehler", parent=self)
         finally:
             self._set_actions_enabled(True)
+
+    def _open_system_settings_dialog(self) -> None:
+        if self._system_settings_win is not None and self._system_settings_win.winfo_exists():
+            self._system_settings_win.lift()
+            return
+        self._energy_value_labels.clear()
+        self._energy_status_pills.clear()
+        self._energy_action_buttons.clear()
+        win = ctk.CTkToplevel(self)
+        self._system_settings_win = win
+        win.title("Energie & Bildschirmschoner")
+        win.geometry("860x760")
+        win.configure(fg_color=self.ogx_colors["bg"])
+        win.transient(self)
+        win.grab_set()
+
+        def on_close() -> None:
+            self._system_settings_win = None
+            self._energy_value_labels.clear()
+            self._energy_status_pills.clear()
+            self._energy_action_buttons.clear()
+            self._battery_guidance_label = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
+        outer = ctk.CTkScrollableFrame(win, fg_color=self.ogx_colors["bg"])
+        outer.pack(fill="both", expand=True, padx=12, pady=12)
+
+        top_bar = ctk.CTkFrame(outer, fg_color="transparent")
+        top_bar.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(top_bar, text="Energie-Dashboard", font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
+        refresh_btn = ctk.CTkButton(top_bar, text="Aktualisieren", width=120, command=self._refresh_energy_dashboard_async)
+        refresh_btn.pack(side="right")
+        self._energy_action_buttons["refresh"] = refresh_btn
+
+        for title in ("Energiestatus", "Eingesteckt", "Akku", "Anzeige & Komfort", "Akku schonen"):
+            sec = ctk.CTkFrame(outer)
+            sec.pack(fill="x", pady=6)
+            ctk.CTkLabel(sec, text=title, font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=10, pady=(8, 4))
+            setattr(self, f"_sec_{title.lower().replace(' ', '_').replace('&', 'und')}", sec)
+
+        self._add_energy_row(getattr(self, "_sec_energiestatus"), "status_ac_mode", "Eingesteckt", "")
+        self._add_energy_row(getattr(self, "_sec_energiestatus"), "status_dc_mode", "Akku", "")
+        self._add_energy_row(getattr(self, "_sec_energiestatus"), "status_battery_percent_setting", "Akkuprozentsatz anzeigen", "", action_key="toggle_battery_percent")
+
+        self._add_energy_row(getattr(self, "_sec_eingesteckt"), "ac_power_button", "Netzschalter-Aktion", "")
+        self._add_energy_row(getattr(self, "_sec_eingesteckt"), "ac_lid_action", "Deckel schließen", "")
+        self._add_energy_row(getattr(self, "_sec_eingesteckt"), "ac_display_timeout", "Bildschirm ausschalten nach", "")
+        self._add_energy_row(getattr(self, "_sec_eingesteckt"), "ac_sleep_timeout", "Standby nach", "")
+
+        self._add_energy_row(getattr(self, "_sec_akku"), "dc_power_button", "Netzschalter-Aktion", "")
+        self._add_energy_row(getattr(self, "_sec_akku"), "dc_lid_action", "Deckel schließen", "")
+        self._add_energy_row(getattr(self, "_sec_akku"), "dc_display_timeout", "Bildschirm ausschalten nach", "")
+        self._add_energy_row(getattr(self, "_sec_akku"), "dc_sleep_timeout", "Standby nach", "")
+
+        self._add_energy_row(getattr(self, "_sec_anzeige_und_komfort"), "dark_mode", "Darkmode", "", action_key="toggle_dark_mode")
+        self._add_energy_row(getattr(self, "_sec_anzeige_und_komfort"), "screensaver_disabled", "Bildschirmschoner deaktivieren", "", action_key="toggle_screensaver")
+        self._add_energy_row(
+            getattr(self, "_sec_anzeige_und_komfort"),
+            "adaptive_brightness",
+            "Adaptive Helligkeit / Inhaltsadaptive Helligkeit",
+            "Sparen Sie Energie, indem Bildschirmkontrast und Helligkeit an angezeigte Inhalte optimiert werden",
+        )
+        self._add_energy_row(
+            getattr(self, "_sec_anzeige_und_komfort"),
+            "usb_power_saving",
+            "USB-Geräte beim ausgeschalteten Bildschirm beenden",
+            "USB-Geräte beenden, wenn der Bildschirm ausgeschaltet ist, um Akkuverbrauch zu verringern",
+        )
+
+        self._add_energy_row(getattr(self, "_sec_akku_schonen"), "battery_percent", "Aktueller Akkustand", "")
+        self._add_energy_row(getattr(self, "_sec_akku_schonen"), "battery_saver", "Energiesparstatus / Schonmodus", "")
+        self._add_energy_row(getattr(self, "_sec_akku_schonen"), "battery_capability", "Ladebegrenzung", "")
+        self._battery_guidance_label = ctk.CTkLabel(
+            getattr(self, "_sec_akku_schonen"),
+            text="",
+            justify="left",
+            anchor="w",
+            wraplength=760,
+            text_color=self.ogx_colors["muted"],
+        )
+        self._battery_guidance_label.pack(fill="x", padx=10, pady=(2, 8))
+        self._refresh_energy_dashboard_async()
+
+    def _add_energy_row(self, section, key: str, label: str, description: str, action_key: str | None = None) -> None:
+        row = ctk.CTkFrame(section, fg_color="transparent")
+        row.pack(fill="x", padx=10, pady=3)
+        row.grid_columnconfigure(0, weight=1)
+        text_host = ctk.CTkFrame(row, fg_color="transparent")
+        text_host.grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(text_host, text=label, anchor="w", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w")
+        if description:
+            ctk.CTkLabel(text_host, text=description, anchor="w", wraplength=620, text_color=self.ogx_colors["muted"]).pack(anchor="w")
+        value = ctk.CTkLabel(row, text="Lädt ...", anchor="w", width=190)
+        value.grid(row=0, column=1, sticky="w", padx=(8, 6))
+        pill = ctk.CTkLabel(row, text="...", width=88, corner_radius=8)
+        pill.grid(row=0, column=2, sticky="e", padx=(4, 8))
+        self._energy_value_labels[key] = value
+        self._energy_status_pills[key] = pill
+        if action_key:
+            btn = ctk.CTkButton(row, text="Umschalten", width=95, height=22, command=lambda k=action_key: self._energy_action_clicked(k))
+            btn.grid(row=0, column=3, sticky="e")
+            self._energy_action_buttons[action_key] = btn
+
+    def _refresh_energy_dashboard_async(self) -> None:
+        def worker() -> None:
+            cfg = get_config_dict(self.logger)
+            ac_mode, dc_mode = read_power_mode_ac_dc()
+            battery_percent_toggle = read_show_battery_percent_state()
+            dark = read_dark_mode()
+            screensaver = read_screensaver_state()
+            adaptive = read_adaptive_brightness_state()
+            usb = read_usb_power_saving_state()
+            battery_pct = read_battery_percent()
+            battery_saver = read_battery_saver_state()
+            battery_cap = read_battery_charge_limit_capability(cfg)
+            data = {
+                "status_ac_mode": ac_mode,
+                "status_dc_mode": dc_mode,
+                "status_battery_percent_setting": self._to_setting_state_from_toggle(battery_percent_toggle, true_label="AN", false_label="AUS"),
+                "ac_power_button": read_power_button_action(True),
+                "ac_lid_action": read_lid_close_action(True),
+                "ac_display_timeout": read_display_timeout(True),
+                "ac_sleep_timeout": read_sleep_timeout(True),
+                "dc_power_button": read_power_button_action(False),
+                "dc_lid_action": read_lid_close_action(False),
+                "dc_display_timeout": read_display_timeout(False),
+                "dc_sleep_timeout": read_sleep_timeout(False),
+                "dark_mode": self._to_setting_state_from_toggle(dark, true_label="AN", false_label="AUS"),
+                "screensaver_disabled": self._to_setting_state_from_toggle(
+                    ToggleReadResult(screensaver.available, not screensaver.on, screensaver.hint, screensaver.detail),
+                    true_label="JA",
+                    false_label="NEIN",
+                ),
+                "adaptive_brightness": adaptive,
+                "usb_power_saving": usb,
+                "battery_percent": battery_pct,
+                "battery_saver": battery_saver,
+                "battery_capability": self._to_setting_state_from_battery_cap(battery_cap),
+                "battery_guidance": battery_cap.guidance,
+            }
+            self.ui_queue.put(("energy_dashboard_data", data))
+
+        self._queue_status("Energieübersicht wird aktualisiert …")
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _to_setting_state_from_toggle(t: ToggleReadResult, *, true_label: str = "AN", false_label: str = "AUS") -> SettingState:
+        if not t.available:
+            return SettingState("Nicht verfügbar", available=False, hint=t.hint or t.detail)
+        return SettingState(true_label if t.on else false_label, available=True, hint=t.hint or t.detail)
+
+    @staticmethod
+    def _to_setting_state_from_battery_cap(cap: BatteryChargeCapability) -> SettingState:
+        if not cap.available:
+            return SettingState("Nicht verfügbar – Hersteller-Tool erforderlich", available=False, hint=cap.guidance)
+        label = f"{cap.vendor}: erkannt"
+        return SettingState(label, available=True, hint=cap.guidance)
+
+    def _energy_action_clicked(self, action_key: str) -> None:
+        def worker() -> None:
+            if action_key == "toggle_dark_mode":
+                cur = read_dark_mode()
+                ok, msg = apply_dark_mode(not cur.on, self.logger)
+            elif action_key == "toggle_screensaver":
+                cur = read_screensaver_state()
+                ok, msg = apply_screensaver_state(not cur.on)
+            elif action_key == "toggle_battery_percent":
+                cur = read_show_battery_percent_state()
+                ok, msg = apply_show_battery_percent_state(not cur.on)
+            else:
+                ok, msg = False, "Unbekannte Aktion"
+            if not ok:
+                self.logger.warning("Energie-Aktion %s fehlgeschlagen: %s", action_key, msg)
+            self.ui_queue.put(("energy_dashboard_action_done", {"ok": ok, "msg": msg, "action": action_key}))
+
+        btn = self._energy_action_buttons.get(action_key)
+        if btn is not None:
+            btn.configure(state="disabled", text="...")
+        self._queue_status("Wird angewendet …")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_energy_dashboard_data(self, data: dict) -> None:
+        rows = [(k, v) for k, v in data.items() if isinstance(v, SettingState)]
+        for key, value, pill_kind in format_energy_status_rows(rows):
+            lb = self._energy_value_labels.get(key)
+            pill = self._energy_status_pills.get(key)
+            if lb is not None:
+                lb.configure(text=value)
+            if pill is not None:
+                if pill_kind == "on":
+                    pill.configure(text="AKTIV", fg_color="#2f7d4f", text_color="#e8fff0")
+                elif pill_kind == "off":
+                    pill.configure(text="INAKTIV", fg_color="#495261", text_color="#f0f4f8")
+                elif pill_kind == "na":
+                    pill.configure(text="N/V", fg_color="#5b3742", text_color="#f7e9ed")
+                else:
+                    pill.configure(text="INFO", fg_color="#424d5d", text_color="#e7eef6")
+        guidance = str(data.get("battery_guidance", "")).strip()
+        if self._battery_guidance_label is not None:
+            self._battery_guidance_label.configure(text=guidance)
+        self._queue_status("Bereit")
+
+    def _apply_energy_action_done(self, payload: dict) -> None:
+        action = str(payload.get("action", ""))
+        btn = self._energy_action_buttons.get(action)
+        if btn is not None:
+            btn.configure(state="normal", text="Umschalten")
+        if not bool(payload.get("ok")):
+            self._queue_status("Hinweis: Änderung konnte nicht vollständig angewendet werden.")
+        self._refresh_energy_dashboard_async()
 
     def _show_about_dialog(self) -> None:
         version_path = EXE_PARENT / "VERSION.txt"
@@ -2873,6 +3284,10 @@ class UpdaterApp(ctk.CTk):
                 self._show_completion_dialog(payload)
             elif action == "energy_screensaver_done" and isinstance(payload, SystemActionResult):
                 self.after(0, lambda r=payload: self._energy_screensaver_finished(r))
+            elif action == "energy_dashboard_data" and isinstance(payload, dict):
+                self._apply_energy_dashboard_data(payload)
+            elif action == "energy_dashboard_action_done" and isinstance(payload, dict):
+                self._apply_energy_action_done(payload)
             elif action == "bootstrap_done" and isinstance(payload, dict):
                 self._set_actions_enabled(True)
                 self._refresh_provider_quick_panel()
