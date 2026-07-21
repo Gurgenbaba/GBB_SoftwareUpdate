@@ -1,5 +1,5 @@
 {
-  "company_name": "GBB Beispiel GmbH",
+  "company_name": "Musterfirma GmbH",
   "enabled_standard_software": [
     "citrix_workspace",
     "adobe_reader",
@@ -260,7 +260,18 @@
   "system_settings": {
     "display_timeout_seconds": 30,
     "sleep_timeout_minutes": 3,
-    "power_profile": "balanced"
+    "power_profile": "balanced",
+    "dark_mode_enabled": false,
+    "screensaver_disabled": false,
+    "show_battery_percent": false,
+    "ac_lid_action": "none",
+    "dc_lid_action": "sleep",
+    "ac_power_button_action": "sleep",
+    "dc_power_button_action": "sleep",
+    "ac_standby_disabled": false,
+    "dc_standby_disabled": false,
+    "adaptive_brightness_enabled": false,
+    "usb_power_saving_enabled": true
   },
   "ui_columns": {
     "checkbox": 44,

@@ -1,4 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
+# Onefile build — alle Ressourcen in eine EXE gepackt.
+# Hinweis: Onefile-Builds haben eine hoehere Antivirus-False-Positive-Rate als Onedir-Builds,
+# weil PyInstaller zur Laufzeit Dateien nach %TEMP% extrahiert (erkannt als Dropper-Verhalten).
+# Fuer Enterprise-Deployment Compexx-InstallTool_onedir.spec verwenden.
 
 from pathlib import Path
 
@@ -55,11 +59,11 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="GBB Updater",
+    name="Compexx-InstallTool",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
@@ -69,4 +73,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=exe_icon,
+    version="version_info.txt" if (project_root / "version_info.txt").exists() else None,
 )

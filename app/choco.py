@@ -135,6 +135,10 @@ class ChocoClient:
             return CommandResult("choco --version", 0, "Chocolatey bereits installiert", "")
         if not self.has_network():
             return CommandResult("choco bootstrap", 1, "", "Keine Netzwerkverbindung für Chocolatey-Installation")
+        # Offizielle Chocolatey-Bootstrap-Methode (https://docs.chocolatey.org/en-us/choco/setup).
+        # Das Script wird von chocolatey.org per HTTPS geladen und direkt ausgefuehrt (iex).
+        # Ein lokaler Hash-Check ist hier nicht moeglich, da Chocolatey selbst kein Hash-Bundle anbietet.
+        # Alternative: Chocolatey vorab per MSI oder GPO ausrollen und bootstrap hier deaktivieren.
         install_script = (
             "Set-ExecutionPolicy Bypass -Scope Process -Force; "
             "[System.Net.ServicePointManager]::SecurityProtocol = "

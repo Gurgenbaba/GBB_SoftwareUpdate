@@ -17,7 +17,7 @@ def _is_onefile_bundle() -> bool:
     return not (_exe_parent() / "_internal").is_dir()
 
 
-APP_NAME = "GBB Software Updater"
+APP_NAME = "Compexx-InstallTool"
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 if getattr(sys, "frozen", False):

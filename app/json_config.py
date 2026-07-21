@@ -26,7 +26,7 @@ CONFIG_JSON_PATH = APP_DIR / "config.json"
 CONFIG_EXAMPLE_PATH = APP_DIR / "config.example.json"
 
 DEFAULT_EXAMPLE_CONFIG: dict[str, Any] = {
-    "company_name": "GBB Beispiel GmbH",
+    "company_name": "Musterfirma GmbH",
     "enabled_standard_software": [
         "citrix_workspace",
         "adobe_reader",
@@ -92,19 +92,19 @@ DEFAULT_EXAMPLE_CONFIG: dict[str, Any] = {
         "verify_poll_max_seconds": 180,
     },
     "system_settings": {
-        "display_timeout_seconds": 30,
-        "sleep_timeout_minutes": 3,
+        "display_timeout_seconds": 900,
+        "sleep_timeout_minutes": 15,
         "power_profile": "balanced",
-        "dark_mode_enabled": False,
-        "screensaver_disabled": False,
-        "show_battery_percent": False,
+        "dark_mode_enabled": True,
+        "screensaver_disabled": True,
+        "show_battery_percent": True,
         "ac_lid_action": "none",
-        "dc_lid_action": "sleep",
+        "dc_lid_action": "none",
         "ac_power_button_action": "sleep",
         "dc_power_button_action": "sleep",
         "ac_standby_disabled": False,
         "dc_standby_disabled": False,
-        "adaptive_brightness_enabled": False,
+        "adaptive_brightness_enabled": True,
         "usb_power_saving_enabled": True,
     },
     "ui_columns": {
@@ -144,6 +144,7 @@ class RuntimeSettings:
     office_tools: dict[str, Any]
     local_source_last_path: str
     local_source_prefer_local: bool
+    local_source_strict: bool = False
     enable_backup: bool = True
     dry_run_default: bool = False
     installer_settle_wait_seconds: int = INSTALLER_SETTLE_WAIT_SECONDS
@@ -173,26 +174,45 @@ def default_software_providers() -> dict[str, Any]:
     return providers
 
 
+def _deep_merge_defaults(existing: dict[str, Any], defaults: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Return (merged, changed) where missing keys from defaults are filled in."""
+    result = dict(existing)
+    changed = False
+    for key, default_val in defaults.items():
+        if key not in result:
+            result[key] = deepcopy(default_val)
+            changed = True
+        elif isinstance(default_val, dict) and isinstance(result[key], dict):
+            result[key], sub_changed = _deep_merge_defaults(result[key], default_val)
+            changed = changed or sub_changed
+    return result, changed
+
+
 def get_config_dict(logger: logging.Logger | None = None) -> dict[str, Any]:
     ensure_config_json_exists(logger)
     try:
         data = json.loads(CONFIG_JSON_PATH.read_text(encoding="utf-8"))
         if isinstance(data, dict):
-            return data
+            merged, changed = _deep_merge_defaults(data, DEFAULT_EXAMPLE_CONFIG)
+            if changed:
+                save_config_dict(merged, logger, backup=False)
+                if logger:
+                    logger.info("config.json mit neuen Standardwerten ergaenzt (Versionsmigration).")
+            return merged
     except (OSError, json.JSONDecodeError) as exc:
         if logger:
             logger.warning("config.json konnte nicht als dict geladen werden (%s).", exc)
     return dict(DEFAULT_EXAMPLE_CONFIG)
 
 
-def save_config_dict(data: dict[str, Any], logger: logging.Logger | None = None) -> None:
+def save_config_dict(data: dict[str, Any], logger: logging.Logger | None = None, *, backup: bool = True) -> None:
     CONFIG_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if CONFIG_JSON_PATH.exists():
+    if backup and CONFIG_JSON_PATH.exists():
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup = CONFIG_JSON_PATH.with_suffix(f".json.bak_{stamp}")
-        shutil.copy2(CONFIG_JSON_PATH, backup)
+        bak = CONFIG_JSON_PATH.with_suffix(f".json.bak_{stamp}")
+        shutil.copy2(CONFIG_JSON_PATH, bak)
         if logger:
-            logger.info("config.json Backup erstellt: %s", backup)
+            logger.info("config.json Backup erstellt: %s", bak)
     CONFIG_JSON_PATH.write_text(
         json.dumps(data, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -338,6 +358,7 @@ def load_runtime_settings(logger: logging.Logger | None = None) -> RuntimeSettin
         local_source = {}
     local_source_last_path = str(local_source.get("last_path", "") or "").strip()
     local_source_prefer_local = bool(local_source.get("prefer_local", True))
+    local_source_strict = bool(local_source.get("strict", False))
     enable_backup = bool(data.get("enable_backup", True))
     dry_run_default = bool(data.get("dry_run_default", False))
     office_tools = _parse_office_tools(data.get("office_tools"))
@@ -416,6 +437,7 @@ def load_runtime_settings(logger: logging.Logger | None = None) -> RuntimeSettin
         office_tools=office_tools,
         local_source_last_path=local_source_last_path,
         local_source_prefer_local=local_source_prefer_local,
+        local_source_strict=local_source_strict,
         enable_backup=enable_backup,
         dry_run_default=dry_run_default,
         installer_settle_wait_seconds=settle_wait,
@@ -452,4 +474,4 @@ def update_provider_resolved_source(
     raw["resolved"] = resolved
     providers[software_key] = raw
     cfg["software_providers"] = providers
-    save_config_dict(cfg, logger)
+    save_config_dict(cfg, logger, backup=False)

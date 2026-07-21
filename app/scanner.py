@@ -377,12 +377,23 @@ class SoftwareScanner:
         if not la:
             return False
         base = Path(la) / "Microsoft" / "Teams"
-        for p in (base / "Update.exe", base / "current" / "Teams.exe"):
-            try:
-                if p.is_file():
-                    return True
-            except OSError:
-                continue
+        # Citrix Workspace VDI optimization drops stubs in this directory that are
+        # very small (< 512 KB). Real Teams Classic Update.exe (Squirrel) and
+        # Teams.exe are both well above 1 MB. Require BOTH files to be present
+        # and each to exceed the size threshold so the Citrix plugin is ignored.
+        _MIN_BYTES = 512 * 1024
+        update_exe = base / "Update.exe"
+        teams_exe = base / "current" / "Teams.exe"
+        try:
+            if (
+                update_exe.is_file()
+                and update_exe.stat().st_size >= _MIN_BYTES
+                and teams_exe.is_file()
+                and teams_exe.stat().st_size >= _MIN_BYTES
+            ):
+                return True
+        except OSError:
+            pass
         return False
 
     @staticmethod
@@ -538,9 +549,9 @@ class SoftwareScanner:
                     index += 1
                     try:
                         with winreg.OpenKey(root, sub_name) as sub_key:
-                            def _get(name: str) -> str:
+                            def _get(name: str, _sk=sub_key) -> str:
                                 try:
-                                    value, _ = winreg.QueryValueEx(sub_key, name)
+                                    value, _ = winreg.QueryValueEx(_sk, name)
                                     return str(value or "").strip()
                                 except OSError:
                                     return ""

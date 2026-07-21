@@ -102,7 +102,7 @@ def try_restore_point_or_registry_export(logger, *, reports_dir: Path) -> tuple[
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
         ps = (
-            "Checkpoint-Computer -Description 'GBB_SoftwareUpdater pre-cleanup' -ErrorAction Stop;"
+            "Checkpoint-Computer -Description 'Compexx-InstallTool pre-cleanup' -ErrorAction Stop;"
             "Write-Output 'RP_OK'"
         )
         cp = subprocess.run(

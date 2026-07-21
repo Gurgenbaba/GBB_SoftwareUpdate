@@ -1,1 +1,1 @@
-"""GBB Software Updater application package."""
+"""Compexx-InstallTool application package."""

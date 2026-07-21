@@ -15,12 +15,15 @@ import urllib.parse
 import urllib.request
 import socket
 import ctypes
-import winreg
+try:
+    import winreg
+except ImportError:  # pragma: no cover
+    winreg = None  # type: ignore[assignment]
 from pathlib import Path
 from typing import Any, Callable
 
 from .choco import CommandResult
-from .config import INSTALL_TIMEOUT_SECONDS, INTERNAL_INSTALLERS, MAX_CHOCO_RETRIES, SOFTWARE_BY_KEY, SoftwarePackage
+from .config import APP_DIR, INSTALL_TIMEOUT_SECONDS, INTERNAL_INSTALLERS, MAX_CHOCO_RETRIES, SOFTWARE_BY_KEY, SoftwarePackage
 from .local_source import LocalSourceService
 from .models import ReportEntry, SoftwareState
 
@@ -28,6 +31,7 @@ DownloadProgressCallback = Callable[[int, int | None], None]
 ActivityCallback = Callable[[str, str, str | None], None]
 
 INSTALLER_LOCK_WAIT_SECONDS = 30
+_DOWNLOAD_CACHE_DIR = APP_DIR / "downloads"
 INSTALLER_LOCK_MAX_ATTEMPTS = 5
 LOCK_PROCESS_NAMES_EXACT = frozenset(
     {
@@ -72,6 +76,7 @@ class InstallerService:
         provider_configs: dict[str, Any] | None = None,
         local_source_service: LocalSourceService | None = None,
         prefer_local_source: bool = False,
+        local_source_strict: bool = False,
         scanner=None,
         installer_settle_wait_seconds: int = 60,
         installer_verify_after_timeout: bool = True,
@@ -85,6 +90,7 @@ class InstallerService:
         self.provider_configs = provider_configs or {}
         self.local_source = local_source_service
         self.prefer_local_source = prefer_local_source
+        self.local_source_strict = local_source_strict
         self.scanner = scanner
         self._installer_settle_wait_seconds = max(0, int(installer_settle_wait_seconds))
         self._installer_verify_after_timeout = bool(installer_verify_after_timeout)
@@ -367,7 +373,10 @@ class InstallerService:
 
         try:
             for index, key in enumerate(selected_keys, start=1):
-                software = self.software_by_key[key]
+                software = self.software_by_key.get(key)
+                if software is None:
+                    self.logger.warning("Software-Key unbekannt, wird uebersprungen: %s", key)
+                    continue
                 self._current_software_key = key
                 self._native_vendor_install_ui = key in NATIVE_VENDOR_INSTALL_UI_KEYS
                 self._prefetched_internal_path = None
@@ -638,6 +647,8 @@ class InstallerService:
                 if dry_run or state.status != "Fehler":
                     return action, state
                 errors.append(f"Lokal/USB: {state.detail}")
+                if self.local_source_strict:
+                    return ("Fehler", SoftwareState("Fehler", detail=f"Lokaler Installer fehlgeschlagen: {state.detail}", provider="Lokal/USB"))
             elif step == "choco" and package_name:
                 self.logger.info("Nutze Provider: Chocolatey (Prioritaetskette)")
                 action, state = self._run_choco_upgrade(package_name, prev, dry_run)
@@ -694,6 +705,8 @@ class InstallerService:
                 if dry_run or state.status != "Fehler":
                     return action, state
                 errors.append(f"Lokal/USB: {state.detail}")
+                if self.local_source_strict:
+                    return ("Fehler", SoftwareState("Fehler", detail=f"Lokaler Installer fehlgeschlagen: {state.detail}", provider="Lokal/USB"))
         if package_name:
             self.logger.info("Nutze Provider: Chocolatey")
             action, state = self._run_choco_upgrade(package_name, prev, dry_run)
@@ -716,7 +729,7 @@ class InstallerService:
             if installer_state.status != "Fehler" and installer_state.status != "Quelle erforderlich":
                 return ("Interner Installer", installer_state)
             errors.append(f"Intern: {installer_state.detail}")
-            if installer_state.status == "Quelle erforderlich" and not errors[:-1]:
+            if installer_state.status == "Quelle erforderlich" and len(errors) == 1:
                 return ("Quelle erforderlich", installer_state)
         if not self.prefer_local_source:
             local = self._run_local_source_installer(software, prev, dry_run)
@@ -751,6 +764,8 @@ class InstallerService:
                 if dry_run or state.status != "Fehler":
                     return action, state
                 errors.append(f"Lokal/USB: {state.detail}")
+                if self.local_source_strict:
+                    return ("Fehler", SoftwareState("Fehler", detail=f"Lokaler Installer fehlgeschlagen: {state.detail}", provider="Lokal/USB"))
         if package_name:
             self.logger.info("Nutze Provider: Chocolatey")
             action, state = self._run_choco_upgrade(package_name, prev, dry_run)
@@ -773,7 +788,7 @@ class InstallerService:
             if installer_state.status != "Fehler" and installer_state.status != "Quelle erforderlich":
                 return ("Interner Installer", installer_state)
             errors.append(f"Intern: {installer_state.detail}")
-            if installer_state.status == "Quelle erforderlich" and not errors[:-1]:
+            if installer_state.status == "Quelle erforderlich" and len(errors) == 1:
                 return ("Quelle erforderlich", installer_state)
         if not self.prefer_local_source:
             local = self._run_local_source_installer(software, prev, dry_run)
@@ -810,7 +825,7 @@ class InstallerService:
             if installer_state.status != "Fehler" and installer_state.status != "Quelle erforderlich":
                 return ("Interner Installer", installer_state)
             errors.append(f"Intern: {installer_state.detail}")
-            if installer_state.status == "Quelle erforderlich" and not errors[:-1]:
+            if installer_state.status == "Quelle erforderlich" and len(errors) == 1:
                 return ("Quelle erforderlich", installer_state)
         if package_name:
             self.logger.info("Nutze Provider: Chocolatey")
@@ -860,7 +875,7 @@ class InstallerService:
             if installer_state.status != "Fehler" and installer_state.status != "Quelle erforderlich":
                 return ("Interner Installer", installer_state)
             errors.append(f"Intern: {installer_state.detail}")
-            if installer_state.status == "Quelle erforderlich" and not errors[:-1]:
+            if installer_state.status == "Quelle erforderlich" and len(errors) == 1:
                 return ("Quelle erforderlich", installer_state)
         if package_name:
             self.logger.info("Nutze Provider: Chocolatey")
@@ -1177,7 +1192,7 @@ class InstallerService:
                     )
             except Exception as exc:  # pylint: disable=broad-except
                 self.logger.error("Download fehlgeschlagen fuer %s: %s", software.display_name, exc)
-                return SoftwareState("Quelle erforderlich", detail=source_text, installed_version="—", available_version="—", provider="Quelle erforderlich")
+                return SoftwareState("Quelle erforderlich", detail=f"{source_text} ({type(exc).__name__}: {exc})", installed_version="—", available_version="—", provider="Quelle erforderlich")
 
         if use_endpoint and dry_run:
             if is_url_source:
@@ -1311,12 +1326,12 @@ class InstallerService:
         installer_type = self.local_source.detect_installer_type(local_installer)
         if installer_type not in {"exe", "msi", "ps1", "bat"}:
             return None
-        if installer_type == "bat":
+        if installer_type in {"bat", "ps1"}:
             return (
                 "Quelle erforderlich",
                 SoftwareState(
                     "Quelle erforderlich",
-                    detail=f"Lokale Datei wird aus Sicherheitsgruenden nicht ausgefuehrt: {local_installer}",
+                    detail=f"Lokale Skriptdatei wird aus Sicherheitsgruenden nicht ausgefuehrt: {local_installer}",
                     provider="Lokal/USB",
                     installer_path=str(local_installer),
                 ),
@@ -1338,9 +1353,9 @@ class InstallerService:
                     installer_path=str(local_installer),
                 ),
             )
+        self.logger.info("[LOCAL] Using installer: %s", local_installer)
         file_hash = LocalSourceService.sha256(local_installer)
-        self.logger.info("Lokaler Installer: %s", local_installer)
-        self.logger.info("Lokaler Installer SHA256: %s", file_hash)
+        self.logger.info("[LOCAL] SHA256: %s", file_hash)
         if installer_type == "msi":
             cmd = ["msiexec", "/i", str(local_installer), "/qn", "/norestart"]
         elif installer_type == "ps1":
@@ -1365,7 +1380,11 @@ class InstallerService:
                 ),
             )
         status = "Installiert" if completed.returncode == 0 else "Fehler"
-        detail = "Lokaler Installer" if completed.returncode == 0 else f"Installer Returncode {completed.returncode}"
+        detail = (
+            f"Quelle: Lokaler Installer\nDatei: {local_installer.name}"
+            if completed.returncode == 0
+            else f"Installer Returncode {completed.returncode}"
+        )
         return (
             "Lokal/USB",
             SoftwareState(
@@ -1382,11 +1401,20 @@ class InstallerService:
     @staticmethod
     def _is_url_source(source: str) -> bool:
         parsed = urllib.parse.urlparse(source)
-        return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+        return parsed.scheme.lower() == "https" and bool(parsed.netloc)
 
     def _download_installer_from_url(self, source: str, *, report_progress: bool = True) -> str:
-        parsed = urllib.parse.urlparse(source)
-        suffix = Path(parsed.path).suffix or ".exe"
+        parsed_url = urllib.parse.urlparse(source)
+        raw_name = Path(parsed_url.path).name or "installer"
+        safe_stem = re.sub(r"[^\w\-.]", "_", Path(raw_name).stem) or "installer"
+        suffix = Path(raw_name).suffix.lower() or ".exe"
+        if suffix not in {".exe", ".msi"}:
+            suffix = ".exe"
+        _DOWNLOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        url_tag = hashlib.sha256(source.encode()).hexdigest()[:10]
+        cache_filename = f"{safe_stem}_{url_tag}{suffix}"
+        cache_path = _DOWNLOAD_CACHE_DIR / cache_filename
+        self.logger.info("[DOWNLOAD] Zieldatei: %s", cache_path)
         chunk_size = 256 * 1024
         progress_cb = self._download_progress if report_progress else None
         with urllib.request.urlopen(source, timeout=60) as response:
@@ -1406,8 +1434,8 @@ class InstallerService:
             if progress_cb and total:
                 progress_cb(0, total)
             try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-                    tmp_path = tmp_file.name
+                with open(cache_path, "wb") as tmp_file:
+                    tmp_path = str(cache_path)
                     while True:
                         chunk = response.read(chunk_size)
                         if not chunk:
@@ -1832,6 +1860,8 @@ class InstallerService:
 
     @staticmethod
     def is_reboot_pending() -> bool:
+        if winreg is None:
+            return False
         checks = (
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending", None),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired", None),

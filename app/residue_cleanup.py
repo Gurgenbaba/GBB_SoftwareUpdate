@@ -258,7 +258,25 @@ def _delete_path_target(path_str: str, logger) -> bool:
         return False
 
 
+_REGISTRY_SAFE_PREFIXES: tuple[str, ...] = (
+    r"HKEY_LOCAL_MACHINE\SOFTWARE\\",
+    r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\\",
+    r"HKEY_CURRENT_USER\SOFTWARE\\",
+    r"HKLM\SOFTWARE\\",
+    r"HKLM\SOFTWARE\WOW6432Node\\",
+    r"HKCU\SOFTWARE\\",
+)
+
+
+def _registry_path_is_safe(full: str) -> bool:
+    norm = full.strip().upper().replace("/", "\\")
+    return any(norm.startswith(p.upper()) for p in _REGISTRY_SAFE_PREFIXES)
+
+
 def _delete_registry_target(full: str, logger) -> bool:
+    if not _registry_path_is_safe(full):
+        logger.warning("[CLEANUP] Registry-Pfad ausserhalb erlaubter Bereiche, uebersprungen: %s", full[:200])
+        return False
     try:
         cp = subprocess.run(
             ["reg", "delete", full, "/f"],

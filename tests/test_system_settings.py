@@ -15,6 +15,8 @@ from app.system_settings import (
 def test_merge_system_settings_defaults() -> None:
     m = merge_system_settings(None)
     assert m["display_timeout_seconds"] == DEFAULT_SYSTEM_SETTINGS["display_timeout_seconds"]
+    assert m["dark_mode_enabled"] == DEFAULT_SYSTEM_SETTINGS["dark_mode_enabled"]
+    assert m["ac_power_button_action"] == "sleep"
     m2 = merge_system_settings({"display_timeout_seconds": 120, "unknown": 1})
     assert m2["display_timeout_seconds"] == 120
     assert "unknown" not in m2

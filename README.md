@@ -1,4 +1,4 @@
-# GBB_SoftwareUpdater (v6)
+# Compexx-InstallTool (v6)
 
 Windows-Software-Updater mit GUI und Provider-Kette:
 **Chocolatey -> WinGet -> Interner Installer -> Lokal/USB -> Quelle erforderlich**
@@ -6,7 +6,7 @@ oder (bei aktivierter Option) **Lokal/USB -> Chocolatey -> WinGet -> Interner In
 
 ## Projektsetup
 
-- Nur **eine** virtuelle Umgebung verwenden: `GBB_SoftwareUpdater/.venv`
+- Nur **eine** virtuelle Umgebung verwenden: `Compexx-InstallTool/.venv`
 - Keine äußere Workspace-`.venv` nutzen
 
 ```powershell
@@ -36,13 +36,13 @@ Root-Wrapper bleibt verfügbar:
 
 ## One-file EXE
 
-- Build-Ausgabe: `dist/GBB_SoftwareUpdater.exe`
+- Build-Ausgabe: `dist/Compexx-InstallTool.exe`
 - Optionales EXE-Icon: `assets/logo.ico` (wird beim Build automatisch verwendet, falls vorhanden)
 - UI-Logo/Fenster-Icon: `assets/logo.png`
 - Runtime-Dateien bei EXE-Start:
-  - `%LOCALAPPDATA%\GBB_SoftwareUpdater\config.json`
-  - `%LOCALAPPDATA%\GBB_SoftwareUpdater\logs\`
-  - `%LOCALAPPDATA%\GBB_SoftwareUpdater\logs\reports\`
+  - `%LOCALAPPDATA%\Compexx-InstallTool\config.json`
+  - `%LOCALAPPDATA%\Compexx-InstallTool\logs\`
+  - `%LOCALAPPDATA%\Compexx-InstallTool\logs\reports\`
 
 `config.example.json` ist die Repo-Vorlage. `config.json` wird zur Laufzeit erstellt (oder als Dev-Fallback aus dem Projekt gelesen).
 

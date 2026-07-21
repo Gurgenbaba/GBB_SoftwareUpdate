@@ -106,11 +106,12 @@ class ReportWriter:
                     "extended_metadata",
                 ]
             )
+            report_ts = datetime.now().isoformat(timespec="seconds")
             for item in entries:
                 software = SOFTWARE_BY_KEY.get(item.software_key)
                 writer.writerow(
                     [
-                        datetime.now().isoformat(timespec="seconds"),
+                        report_ts,
                         socket.gethostname(),
                         getpass.getuser(),
                         software.display_name if software else item.software_key,
@@ -163,37 +164,100 @@ class ReportWriter:
         return entries
 
 
+def _html_badge(text: str, status: str) -> str:
+    """Return a colored <span> badge for a status value."""
+    s = status.lower()
+    if s in ("installiert", "aktuell", "ok"):
+        bg, fg = "#14532D", "#BBF7D0"
+    elif s in ("fehler", "quelle erforderlich"):
+        bg, fg = "#7F1D1D", "#FECACA"
+    elif s in ("update verfuegbar", "hinweis", "warnung"):
+        bg, fg = "#78350F", "#FDE68A"
+    elif s == "prueft":
+        bg, fg = "#1E3A8A", "#BFDBFE"
+    elif s in ("nicht installiert", "offen", "nicht geprueft"):
+        bg, fg = "#334155", "#E2E8F0"
+    else:
+        bg, fg = "#2F455C", "#CBD5E1"
+    return (
+        f'<span style="display:inline-block;padding:2px 8px;border-radius:4px;'
+        f'font-size:11px;font-weight:600;background:{bg};color:{fg}">'
+        f'{html.escape(text)}</span>'
+    )
+
+
 def write_html_report(entries: list[ReportEntry], report_type: str, title_line: str) -> Path:
-    """UTF-8 HTML summary next to CSV naming convention."""
+    """UTF-8 HTML summary — corporate dark theme."""
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp_readable = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     path = REPORT_DIR / f"{report_type}_{stamp}.html"
-    rows: list[str] = []
+
+    ok_n = sum(1 for e in entries if e.status_after in ("Installiert", "Aktuell"))
+    warn_n = sum(1 for e in entries if e.status_after == "Update verfuegbar")
+    err_n = sum(1 for e in entries if "Fehler" in e.status_after or e.status_after == "Quelle erforderlich")
+    reboot_n = sum(1 for e in entries if str(e.reboot_required).lower() in ("ja", "yes", "true", "1"))
+
+    summary_cards = (
+        f'<div class="card"><div class="card-num" style="color:#BBF7D0">{ok_n}</div><div class="card-lbl">OK / Aktuell</div></div>'
+        f'<div class="card"><div class="card-num" style="color:#FDE68A">{warn_n}</div><div class="card-lbl">Hinweise</div></div>'
+        f'<div class="card"><div class="card-num" style="color:#FECACA">{err_n}</div><div class="card-lbl">Fehler</div></div>'
+        f'<div class="card"><div class="card-num" style="color:#BFDBFE">{reboot_n}</div><div class="card-lbl">Neustart</div></div>'
+    )
+
+    rows_html: list[str] = []
     for item in entries:
         software = SOFTWARE_BY_KEY.get(item.software_key)
         name = software.display_name if software else item.software_key
-        rows.append(
+        reboot_txt = "Ja" if str(item.reboot_required).lower() in ("ja", "yes", "true", "1") else "Nein"
+        rows_html.append(
             "<tr>"
             f"<td>{html.escape(name)}</td>"
             f"<td>{html.escape(item.action)}</td>"
-            f"<td>{html.escape(item.status_after)}</td>"
+            f"<td>{_html_badge(item.status_after, item.status_after)}</td>"
             f"<td>{html.escape(item.result)}</td>"
             f"<td>{html.escape(item.provider)}</td>"
             f"<td>{html.escape(item.verification_status or '')}</td>"
             f"<td>{html.escape(item.cleanup_classification or '')}</td>"
-            f"<td>{html.escape(item.reboot_required)}</td>"
+            f"<td>{'⚠ Ja' if reboot_txt == 'Ja' else 'Nein'}</td>"
             "</tr>"
         )
+
     body = f"""<!DOCTYPE html>
-<html lang="de"><head><meta charset="utf-8"/><title>{html.escape(title_line)}</title>
-<style>body{{font-family:Segoe UI,Arial,sans-serif;margin:24px;}} table{{border-collapse:collapse;width:100%;max-width:1200px;}}
-th,td{{border:1px solid #ccc;padding:6px 8px;text-align:left;font-size:13px;}} th{{background:#f4f4f4;}}</style></head>
-<body><h1>{html.escape(title_line)}</h1>
-<p>{html.escape(stamp)} · {html.escape(socket.gethostname())} · {html.escape(getpass.getuser())}</p>
-<table><thead><tr>
-<th>Software</th><th>Aktion</th><th>Status</th><th>Ergebnis</th><th>Provider</th><th>Verifikation</th><th>Bereinigung</th><th>Neustart</th>
-</tr></thead><tbody>
-{"".join(rows)}
-</tbody></table></body></html>"""
+<html lang="de">
+<head>
+<meta charset="utf-8"/>
+<title>{html.escape(title_line)}</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:'Segoe UI',Arial,sans-serif;background:#111827;color:#F8FAFC;padding:24px 32px;font-size:13px}}
+  .header{{background:#163847;border:1px solid #2F455C;border-radius:8px;padding:18px 24px;margin-bottom:20px}}
+  .header h1{{font-size:20px;font-weight:700;color:#D9A441;margin-bottom:4px}}
+  .header p{{color:#CBD5E1;font-size:12px}}
+  .cards{{display:flex;gap:12px;margin-bottom:20px}}
+  .card{{background:#1B2836;border:1px solid #2F455C;border-radius:8px;padding:14px 20px;min-width:120px;text-align:center}}
+  .card-num{{font-size:28px;font-weight:700;line-height:1}}
+  .card-lbl{{font-size:11px;color:#CBD5E1;margin-top:4px}}
+  table{{width:100%;border-collapse:collapse;background:#1B2836;border-radius:8px;overflow:hidden;border:1px solid #2F455C}}
+  thead tr{{background:#223244}}
+  th{{padding:10px 12px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#CBD5E1;font-weight:600;border-bottom:1px solid #2F455C}}
+  td{{padding:9px 12px;border-bottom:1px solid #2F455C;color:#F8FAFC;vertical-align:middle}}
+  tbody tr:nth-child(even){{background:#26384C}}
+  tbody tr:hover{{background:#2F455C}}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>{html.escape(title_line)}</h1>
+  <p>{html.escape(stamp_readable)} &nbsp;·&nbsp; {html.escape(socket.gethostname())} &nbsp;·&nbsp; {html.escape(getpass.getuser())}</p>
+</div>
+<div class="cards">{summary_cards}</div>
+<table>
+  <thead><tr>
+    <th>Software</th><th>Aktion</th><th>Status</th><th>Ergebnis</th><th>Provider</th><th>Verifikation</th><th>Bereinigung</th><th>Neustart</th>
+  </tr></thead>
+  <tbody>{"".join(rows_html)}</tbody>
+</table>
+</body></html>"""
     path.write_text(body, encoding="utf-8")
     return path

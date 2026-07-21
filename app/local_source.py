@@ -36,8 +36,16 @@ class LocalSourceService:
             return 0
         self.root_path = root
         found: list[Path] = []
+        _MAX_DEPTH = 6
+        _ALLOWED_EXTS = {".exe", ".msi"}
         for path in root.rglob("*"):
-            if path.is_file() and path.suffix.lower() in {".exe", ".msi", ".ps1", ".bat"}:
+            try:
+                depth = len(path.relative_to(root).parts)
+            except ValueError:
+                continue
+            if depth > _MAX_DEPTH:
+                continue
+            if path.is_file() and path.suffix.lower() in _ALLOWED_EXTS:
                 found.append(path)
         self._files = found
         self.logger.info("Lokale Quelle gescannt: %s (%s Dateien)", root, len(found))
@@ -45,7 +53,7 @@ class LocalSourceService:
 
     def detect_installer_type(self, path: str | Path) -> str:
         ext = Path(path).suffix.lower()
-        if ext in {".exe", ".msi", ".ps1", ".bat"}:
+        if ext in {".exe", ".msi"}:
             return ext[1:]
         return ""
 
@@ -58,18 +66,30 @@ class LocalSourceService:
         cfg_raw = self.software_providers.get(software_key, {})
         cfg = cfg_raw if isinstance(cfg_raw, dict) else {}
 
-        patterns: list[str] = []
-        local_patterns = cfg.get("local_patterns")
-        if isinstance(local_patterns, list):
-            patterns.extend(str(item).strip() for item in local_patterns if str(item).strip())
-        patterns.extend(
-            [
-                f"*{software.display_name}*.exe",
-                f"*{software.display_name}*.msi",
-                f"*{software.key.replace('_', '')}*.exe",
-                f"*{software.key.replace('_', '')}*.msi",
-            ]
-        )
+        local_patterns_raw = cfg.get("local_patterns")
+        configured_patterns: list[str] = []
+        if isinstance(local_patterns_raw, list):
+            configured_patterns = [str(item).strip() for item in local_patterns_raw if str(item).strip()]
+
+        if configured_patterns:
+            # Strict filename matching: only files that match the configured patterns qualify.
+            normalized = [p.lower() for p in configured_patterns]
+            for file_path in self._files:
+                filename = file_path.name.lower()
+                rel = str(file_path).lower()
+                if any(fnmatch.fnmatch(filename, p) for p in normalized):
+                    return file_path
+                if any(fnmatch.fnmatch(rel, p) for p in normalized):
+                    return file_path
+            return None
+
+        # No configured patterns: broad auto-generated search.
+        patterns: list[str] = [
+            f"*{software.display_name}*.exe",
+            f"*{software.display_name}*.msi",
+            f"*{software.key.replace('_', '')}*.exe",
+            f"*{software.key.replace('_', '')}*.msi",
+        ]
         search_terms = cfg.get("search_terms", software.search_terms)
         if isinstance(search_terms, list):
             patterns.extend(f"*{str(term).strip()}*.exe" for term in search_terms if str(term).strip())

@@ -5,7 +5,7 @@
 - Health Summary Panel oben (Checks/Details, Warnungen und Konfiguration getrennt).
 - Softwareliste: Suche, Auswahl **Nur fehlende** / **Nur Updates** / **Standard Patch Run**.
 - Abschluss-Dialog nach Pruefung und Installation; optionaler PDF-Export (`fpdf2`).
-- PyInstaller **one-file** (`dist/GBB_SoftwareUpdater.exe`); beschreibbare Daten unter `%LOCALAPPDATA%\GBB_SoftwareUpdater\`, Bundle-Ressourcen ueber `_MEIPASS` / `BUNDLE_DIR`.
+- PyInstaller **one-file** (`dist/Compexx-InstallTool.exe`); beschreibbare Daten unter `%LOCALAPPDATA%\Compexx-InstallTool\`, Bundle-Ressourcen ueber `_MEIPASS` / `BUNDLE_DIR`.
 
 ## 4.0.0
 

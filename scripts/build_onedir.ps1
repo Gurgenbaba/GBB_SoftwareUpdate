@@ -4,16 +4,17 @@ $ErrorActionPreference = "Stop"
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $projectRoot
 
-$distExe = Join-Path $projectRoot "dist\Compexx-InstallTool.exe"
+# Onedir-Build: niedrigere AV-False-Positive-Rate als Onefile.
+# Verteile den gesamten Ordner dist\Compexx-InstallTool\, nicht nur die EXE.
+
+$distDir = Join-Path $projectRoot "dist\Compexx-InstallTool"
+$distExe = Join-Path $distDir "Compexx-InstallTool.exe"
+
 Get-Process -Name "Compexx-InstallTool" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 800
-if (Test-Path -LiteralPath $distExe) {
-    try {
-        Remove-Item -LiteralPath $distExe -Force
-    } catch {
-        $bak = "$distExe.bak-$(Get-Date -Format 'yyyyMMddHHmmss')"
-        Move-Item -LiteralPath $distExe -Destination $bak -Force
-    }
+
+if (Test-Path -LiteralPath $distDir) {
+    Remove-Item -LiteralPath $distDir -Recurse -Force
 }
 
 $venvPython = Join-Path $projectRoot ".venv\Scripts\python.exe"
@@ -22,12 +23,13 @@ if (-not (Test-Path $venvPython)) {
 }
 
 & $venvPython -m compileall .
+
 $venvPyInstaller = Join-Path $projectRoot ".venv\Scripts\pyinstaller.exe"
 if (Test-Path $venvPyInstaller) {
-    & $venvPyInstaller -y --clean Compexx-InstallTool.spec
+    & $venvPyInstaller -y --clean Compexx-InstallTool_onedir.spec
 } else {
     Write-Host "PyInstaller nicht in Projekt-venv gefunden, nutze PATH-Binary."
-    pyinstaller -y --clean Compexx-InstallTool.spec
+    pyinstaller -y --clean Compexx-InstallTool_onedir.spec
 }
 if ($LASTEXITCODE -ne 0) {
     throw "Build fehlgeschlagen: PyInstaller ExitCode $LASTEXITCODE"
@@ -38,5 +40,9 @@ if (-not (Test-Path -LiteralPath $distExe)) {
 }
 
 $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $distExe
-Write-Host "Build erfolgreich: $distExe"
-Write-Host "SHA256: $($hash.Hash)"
+Write-Host ""
+Write-Host "Onedir-Build erfolgreich: $distDir"
+Write-Host "EXE: $distExe"
+Write-Host "SHA256 (EXE): $($hash.Hash)"
+Write-Host ""
+Write-Host "HINWEIS: Den gesamten Ordner '$distDir' verteilen, nicht nur die EXE."

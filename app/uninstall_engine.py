@@ -166,9 +166,9 @@ def enumerate_uninstall_entries() -> list[dict[str, str]]:
                         try:
                             with winreg.OpenKey(hive, key_path) as sk:
 
-                                def _get(name: str) -> str:
+                                def _get(name: str, _sk=sk) -> str:
                                     try:
-                                        value, _ = winreg.QueryValueEx(sk, name)
+                                        value, _ = winreg.QueryValueEx(_sk, name)
                                         return str(value or "").strip()
                                     except OSError:
                                         return ""

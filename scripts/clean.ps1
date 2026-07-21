@@ -26,7 +26,7 @@ Get-ChildItem -Path $projectRoot -Recurse -Directory -Filter "__pycache__" -Erro
 }
 
 if ($Runtime) {
-    $runtimeDir = Join-Path $env:LOCALAPPDATA "GBB_SoftwareUpdater"
+    $runtimeDir = Join-Path $env:LOCALAPPDATA "Compexx-InstallTool"
     if (Test-Path $runtimeDir) {
         Remove-Item -Recurse -Force $runtimeDir
         Write-Host "Runtime-Daten entfernt: $runtimeDir"

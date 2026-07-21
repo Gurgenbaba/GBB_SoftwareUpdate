@@ -3,8 +3,8 @@ from __future__ import annotations
 import ctypes
 import os
 import platform
-import subprocess
 import queue
+import sys
 import shutil
 import threading
 from dataclasses import replace
@@ -41,13 +41,22 @@ from .residue_cleanup import apply_selected_cleanup, run_residue_cleanup_phase
 from .scanner import SoftwareScanner
 from .system_settings import (
     BatteryChargeCapability,
+    DEFAULT_SYSTEM_SETTINGS,
     DEFAULT_UI_COLUMNS,
     MIN_UI_COLUMNS,
     SettingState,
     UI_COLUMN_KEYS,
     ToggleReadResult,
+    apply_adaptive_brightness_state,
+    apply_display_timeout,
+    apply_lid_close_action,
+    apply_power_button_action,
+    apply_power_profile_toggle,
+    apply_sleep_timeout,
     apply_show_battery_percent_state,
     apply_screensaver_state,
+    apply_usb_power_saving_state,
+    coerce_system_settings,
     format_energy_status_rows,
     merge_ui_columns,
     read_battery_charge_limit_capability,
@@ -57,6 +66,7 @@ from .system_settings import (
     read_display_timeout,
     read_lid_close_action,
     read_power_button_action,
+    read_power_profile_toggle,
     read_power_mode_ac_dc,
     read_screensaver_state,
     read_show_battery_percent_state,
@@ -64,6 +74,8 @@ from .system_settings import (
     read_adaptive_brightness_state,
     read_usb_power_saving_state,
     apply_dark_mode,
+    read_show_file_extensions,
+    apply_show_file_extensions,
 )
 from .system_tools import SystemActionResult, SystemToolsService
 
@@ -74,17 +86,26 @@ class UpdaterApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
         self._apply_display_scaling()
+        # Palette aus compexx-finanz.de abgeleitet: dunkles Marken-Navy, Marken-Blau als
+        # Interaktionsfarbe, Gold als Zweitakzent, Rot/Farbverlaufs-Cyan aus dem Farbstreifen-Logo.
         self.ogx_colors = {
-            "bg": "#0f1115",
-            "panel": "#171b22",
-            "panel_alt": "#1d232d",
-            "border": "#2a3340",
-            "text": "#e6edf7",
-            "muted": "#a4b0c0",
-            "accent": "#4c6ef5",
-            "accent_hover": "#3f5bd6",
-            "danger": "#cc6677",
+            "bg":           "#111827",
+            "panel":        "#14313F",
+            "panel_alt":    "#1B3B4A",
+            "table":        "#1F4356",
+            "table_alt":    "#274F63",
+            "border":       "#2E5470",
+            "text":         "#F8FAFC",
+            "muted":        "#B7C4D1",
+            "accent":       "#0D6EFD",   # compexx Marken-Blau
+            "accent_hover": "#3D8BFD",
+            "gold":         "#F1A71E",   # compexx Gold-Zweitakzent
+            "gold_hover":   "#F5BB4A",
+            "cyan":         "#4AA8CC",
+            "danger":       "#DC2626",
+            "danger_hover": "#B91C1C",
         }
+        self._resize_after_id: str | None = None
         self.configure(fg_color=self.ogx_colors["bg"])
         self._apply_window_size()
 
@@ -93,6 +114,21 @@ class UpdaterApp(ctk.CTk):
         self.logger, self.log_file = build_logger(self._enqueue_log)
         self.runtime = load_runtime_settings(self.logger)
         self.logger.info("Laufzeitkonfiguration: %s", CONFIG_JSON_PATH)
+        _is_packaged = getattr(sys, "frozen", False)
+        _is_onedir = _is_packaged and (EXE_PARENT / "_internal").is_dir()
+        _build_mode = "onedir" if _is_onedir else ("onefile" if _is_packaged else "source")
+        _version = "unbekannt"
+        try:
+            _ver_file = BUNDLE_DIR / "VERSION.txt"
+            if _ver_file.is_file():
+                _version = _ver_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+        self.logger.info(
+            "[STARTUP] app=%s version=%s packaged=%s build=%s dry_run=%s",
+            APP_NAME, _version, _is_packaged, _build_mode,
+            getattr(self.runtime, "dry_run_default", False),
+        )
         if getattr(self.runtime, "dry_run_default", False):
             self.dry_run_var.set(True)
 
@@ -117,6 +153,7 @@ class UpdaterApp(ctk.CTk):
             provider_configs=self.runtime.software_providers,
             local_source_service=self.local_source,
             prefer_local_source=self.runtime.local_source_prefer_local,
+            local_source_strict=self.runtime.local_source_strict,
             scanner=self.scanner,
             installer_settle_wait_seconds=self.runtime.installer_settle_wait_seconds,
             installer_verify_after_timeout=self.runtime.installer_verify_after_timeout,
@@ -148,6 +185,7 @@ class UpdaterApp(ctk.CTk):
         self.last_report_file: Path | None = None
         self.history_scroll: ctk.CTkScrollableFrame | None = None
         self.logo_image: PhotoImage | None = None
+        self.app_icon_image: PhotoImage | None = None
         self.settings_btn: ctk.CTkButton | None = None
         self._progress_phase = ""
         self._last_status_message = "Bereit"
@@ -157,7 +195,8 @@ class UpdaterApp(ctk.CTk):
         self._active_item_display = ""
         self._last_prog_done = 0
         self._last_prog_total = 0
-        self.filter_segment: ctk.CTkSegmentedButton | None = None
+        self.filter_segment: ctk.CTkSegmentedButton | None = None  # kept for compat; use _active_filter_mode
+        self._active_filter_mode: str = "Alle"
         self.search_var = ctk.StringVar(value="")
         self.health_scroll: ctk.CTkScrollableFrame | None = None
         self.health_details_label: ctk.CTkLabel | None = None
@@ -175,6 +214,9 @@ class UpdaterApp(ctk.CTk):
         self.system_tools_output_box: ctk.CTkTextbox | None = None
         self.system_tools_tabview: ctk.CTkTabview | None = None
         self.system_tools_status_labels: dict[str, ctk.CTkLabel] = {}
+        self._device_settings_output_box: ctk.CTkTextbox | None = None
+        self._device_settings_tabview: ctk.CTkTabview | None = None
+        self._device_settings_status_labels: dict[str, ctk.CTkLabel] = {}
         self._tooltip_toplevel: ctk.CTkToplevel | None = None
         self._tooltip_label: ctk.CTkLabel | None = None
         self._tooltip_after_id: str | None = None
@@ -199,6 +241,7 @@ class UpdaterApp(ctk.CTk):
         self.device_settings_btn: ctk.CTkButton | None = None
         self._toolbar_buttons: list[ctk.CTkButton] = []
         self._toolbar_cols: int | None = None
+        self._toolbar_groups: list[tuple[str, ctk.CTkFrame, list[ctk.CTkButton]]] = []
         self._filter_heading: ctk.CTkLabel | None = None
         self._search_heading: ctk.CTkLabel | None = None
         self._filter_bar_stacked: bool | None = None
@@ -211,6 +254,11 @@ class UpdaterApp(ctk.CTk):
         self._layout_warmup_tries = 0
         self._ui_column_widths: dict[str, int] = merge_ui_columns(get_config_dict(self.logger).get("ui_columns"))
         self._col_resize_drag: tuple[str, str, int] | None = None
+        self.content_split_grip: ctk.CTkFrame | None = None
+        self._content_split_override_px: int | None = None
+        self._content_split_drag: tuple[int, int] | None = None
+        self._history_scroll_height: int = 48
+        self._history_split_drag: tuple[int, int] | None = None
         self._system_settings_win: ctk.CTkToplevel | None = None
         self._energy_value_labels: dict[str, ctk.CTkLabel] = {}
         self._energy_status_pills: dict[str, ctk.CTkLabel] = {}
@@ -218,7 +266,12 @@ class UpdaterApp(ctk.CTk):
         self._battery_guidance_label: ctk.CTkLabel | None = None
         self.program_name_labels: dict[str, ctk.CTkLabel] = {}
         self.checkbox_widgets: dict[str, ctk.CTkCheckBox] = {}
+        self.row_progress_cells: dict[str, ctk.CTkFrame] = {}
+        self.progress_cell_frame_header: ctk.CTkFrame | None = None
         self._header_grip_widgets: list[ctk.CTkFrame] = []
+        self._header_cell_frames: dict[str, ctk.CTkFrame] = {}
+        self._row_cell_frames: dict[str, dict[str, ctk.CTkFrame]] = {}
+        self._filter_count_labels: dict[str, ctk.CTkLabel] = {}
 
         self._ensure_runtime_catalog()
         self._apply_title()
@@ -312,10 +365,22 @@ class UpdaterApp(ctk.CTk):
 
     def _build_layout(self) -> None:
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1, minsize=260)
+        self.grid_rowconfigure(3, weight=1, minsize=260)
+
+        # Marken-Farbstreifen (compexx-finanz.de Farbverlauf) als dekorativer Kopfbalken.
+        brand_stripe = ctk.CTkFrame(self, fg_color="transparent", height=6)
+        brand_stripe.pack_propagate(False)
+        brand_stripe.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 0))
+        for stripe_color in (
+            "#9FD6F5", "#4A9ECD", "#3F68AE", "#3C4D9D", "#3F2B74",
+            "#6B205B", "#A0326A", "#A62B27", "#DF643A", "#E4803A", "#F6C452",
+        ):
+            ctk.CTkFrame(brand_stripe, fg_color=stripe_color, corner_radius=0).pack(
+                side="left", fill="both", expand=True
+            )
 
         self.health_frame = ctk.CTkFrame(self, corner_radius=10)
-        self.health_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 4))
+        self.health_frame.grid(row=1, column=0, sticky="ew", padx=8, pady=(6, 4))
         self.health_frame.grid_columnconfigure(0, weight=1)
         self.health_frame.grid_columnconfigure(1, weight=0)
         self.health_frame.grid_rowconfigure(2, weight=1)
@@ -378,7 +443,7 @@ class UpdaterApp(ctk.CTk):
 
         top_frame = ctk.CTkFrame(self, corner_radius=12)
         self.top_frame = top_frame
-        top_frame.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+        top_frame.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 4))
         top_frame.grid_columnconfigure(1, weight=1)
         top_frame.grid_columnconfigure(2, weight=1)
 
@@ -387,17 +452,27 @@ class UpdaterApp(ctk.CTk):
             logo_path = BUNDLE_DIR / "assets" / "logo.png"
         if logo_path.exists():
             try:
+                # Wortmarke: Breite bevorzugt begrenzen, Höhe passt sich dem Seitenverhältnis an.
                 pil_logo = Image.open(logo_path).convert("RGBA")
-                max_px = 100
-                pil_logo.thumbnail((max_px, max_px), Image.Resampling.LANCZOS)
+                pil_logo.thumbnail((240, 72), Image.Resampling.LANCZOS)
                 self.logo_image = ImageTk.PhotoImage(pil_logo)
-                # Also set the window/app icon when logo is available.
-                self.iconphoto(True, self.logo_image)
-                ctk.CTkLabel(top_frame, text="", image=self.logo_image).grid(row=0, column=0, rowspan=5, padx=8, pady=8)
+                ctk.CTkLabel(top_frame, text="", image=self.logo_image).grid(row=0, column=0, rowspan=5, padx=(12, 8), pady=8)
             except Exception as exc:  # pragma: no cover
                 self.logger.warning("Logo konnte nicht geladen werden: %s", exc)
         else:
-            self.logger.info("Kein assets/logo.png gefunden; UI-Logo/Icon wird uebersprungen.")
+            self.logger.info("Kein assets/logo.png gefunden; UI-Logo wird uebersprungen.")
+
+        icon_path = EXE_PARENT / "assets" / "logo.ico"
+        if not icon_path.exists():
+            icon_path = BUNDLE_DIR / "assets" / "logo.ico"
+        if icon_path.exists():
+            try:
+                # Quadratisches Badge-Icon fuer Fenster/Taskleiste (separat von der breiten Wortmarke).
+                pil_icon = Image.open(icon_path).convert("RGBA")
+                self.app_icon_image = ImageTk.PhotoImage(pil_icon)
+                self.iconphoto(True, self.app_icon_image)
+            except Exception as exc:  # pragma: no cover
+                self.logger.warning("Icon konnte nicht geladen werden: %s", exc)
 
         ctk.CTkLabel(top_frame, text=APP_NAME, font=ctk.CTkFont(size=18, weight="bold")).grid(
             row=0, column=1, sticky="w", padx=6, pady=(4, 0)
@@ -483,145 +558,209 @@ class UpdaterApp(ctk.CTk):
         )
         self.quick_panel_label.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 6))
 
-        content = ctk.CTkFrame(self)
+        content = ctk.CTkFrame(self, fg_color="transparent")
         self.content_frame = content
-        content.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 4))
+        content.grid(row=3, column=0, sticky="nsew", padx=8, pady=(0, 4))
         # Softwareliste deutlich breiter als Log-Spalte (Aktionen liegen über dem Log).
+        # Spalte 1 ist der schmale, ziehbare Trenngriff zwischen Liste (0) und Log (2).
         content.grid_columnconfigure(0, weight=5)
-        content.grid_columnconfigure(1, weight=1)
+        content.grid_columnconfigure(1, weight=0, minsize=6)
+        content.grid_columnconfigure(2, weight=1)
         content.grid_rowconfigure(0, weight=0)
         content.grid_rowconfigure(1, weight=1, minsize=200)
         content.grid_rowconfigure(2, weight=0)
 
-        filter_bar = ctk.CTkFrame(content)
-        self.filter_bar_frame = filter_bar
-        filter_bar.grid(row=0, column=0, sticky="ew", padx=(6, 4), pady=(4, 4))
-        filter_bar.grid_columnconfigure(1, weight=1)
-        filter_bar.grid_columnconfigure(3, weight=1)
-        filter_bar.grid_rowconfigure(0, weight=0)
-        filter_bar.grid_rowconfigure(1, weight=0)
-        self._filter_heading = ctk.CTkLabel(filter_bar, text="Filter", font=ctk.CTkFont(size=10, weight="bold"))
-        self._filter_heading.grid(row=0, column=0, padx=6, pady=4, sticky="w")
-        self.filter_segment = ctk.CTkSegmentedButton(
-            filter_bar,
-            values=["Alle", "Updates", "Fehlend", "Fehler"],
-            command=self._on_filter_change,
-            font=ctk.CTkFont(size=10),
-            height=20,
-        )
-        self.filter_segment.set("Alle")
-        self.filter_segment.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
-        self._search_heading = ctk.CTkLabel(filter_bar, text="Suche", font=ctk.CTkFont(size=10, weight="bold"))
-        self._search_heading.grid(row=0, column=2, padx=(12, 4), pady=4, sticky="w")
-        self.search_entry = ctk.CTkEntry(
-            filter_bar, textvariable=self.search_var, placeholder_text="Programmname filtern ...", height=20, font=ctk.CTkFont(size=10)
-        )
-        self.search_entry.grid(row=0, column=3, sticky="ew", padx=6, pady=4)
+        self.content_split_grip = ctk.CTkFrame(content, width=6, fg_color=self.ogx_colors["border"], corner_radius=1)
+        self.content_split_grip.grid(row=0, column=1, rowspan=2, sticky="ns", pady=6)
+        try:
+            self.content_split_grip.configure(cursor="sb_h_double_arrow")
+        except Exception:
+            pass
+        self.content_split_grip.bind("<ButtonPress-1>", self._on_content_split_start)
+        self.content_split_grip.bind("<B1-Motion>", self._on_content_split_motion)
+        self.content_split_grip.bind("<ButtonRelease-1>", self._on_content_split_end)
+        self.content_split_grip.bind("<Double-Button-1>", self._on_content_split_reset)
+        self.content_split_grip.bind("<Enter>", lambda _e: self.content_split_grip.configure(fg_color=self.ogx_colors["accent"]))
+        self.content_split_grip.bind("<Leave>", lambda _e: self.content_split_grip.configure(fg_color=self.ogx_colors["border"]))
+        self._attach_tooltip(self.content_split_grip, "Ziehen, um Softwareliste/Log-Spalte zu verschieben. Doppelklick setzt zurück.")
 
-        software_frame = ctk.CTkScrollableFrame(content, label_text="Softwarestatus", scrollbar_button_hover_color=("gray70", "gray30"))
+        # Toolbar row: locked to a fixed compact height so it can never be expanded
+        # by tkinter's row-height sharing with the log_frame (which has rowspan=2).
+        filter_bar = ctk.CTkFrame(content, fg_color="transparent", height=32)
+        filter_bar.pack_propagate(False)
+        self.filter_bar_frame = filter_bar
+        filter_bar.grid(row=0, column=0, sticky="ew", padx=(6, 4), pady=(2, 2))
+        _fbf = ctk.CTkFont(size=10)
+        _py = 5  # vertical padding inside the 32 px frame — centers 22 px children
+        for _mode in ("Alle", "Updates", "Fehlend", "Fehler"):
+            _is_active = _mode == "Alle"
+            _btn = ctk.CTkButton(
+                filter_bar,
+                text=_mode,
+                width=76,
+                height=22,
+                font=_fbf,
+                fg_color=self.ogx_colors["accent"] if _is_active else self.ogx_colors["panel_alt"],
+                hover_color=self.ogx_colors["accent_hover"] if _is_active else self.ogx_colors["border"],
+                command=lambda m=_mode: self._on_filter_change(m),
+            )
+            _btn.pack(side="left", padx=(0, 2), pady=_py)
+            self._filter_count_labels[_mode] = _btn
+        _sep = ctk.CTkFrame(filter_bar, width=1, height=20, fg_color=self.ogx_colors["border"])
+        _sep.pack(side="left", padx=(6, 6), pady=_py)
+        self._search_heading = ctk.CTkLabel(filter_bar, text="Suche", font=_fbf)
+        self._search_heading.pack(side="left", padx=(0, 4), pady=_py)
+        self.search_entry = ctk.CTkEntry(
+            filter_bar, textvariable=self.search_var, placeholder_text="Programmname ...", height=22, font=_fbf, width=160
+        )
+        self.search_entry.pack(side="left", pady=_py)
+        _sep2 = ctk.CTkFrame(filter_bar, width=1, height=20, fg_color=self.ogx_colors["border"])
+        _sep2.pack(side="left", padx=(8, 6), pady=_py)
+        reset_cols = ctk.CTkButton(
+            filter_bar,
+            text="Spalten: Standard",
+            width=118,
+            height=22,
+            font=_fbf,
+            command=self._reset_ui_columns_to_defaults,
+        )
+        reset_cols.pack(side="left", pady=_py)
+        self._attach_tooltip(reset_cols, "Setzt alle Spaltenbreiten auf die Standardwerte aus der Konfiguration.")
+
+        software_frame = ctk.CTkScrollableFrame(
+            content, label_text="Softwarestatus",
+            fg_color=self.ogx_colors["panel_alt"],
+            scrollbar_button_color=self.ogx_colors["border"],
+            scrollbar_button_hover_color=self.ogx_colors["accent"],
+        )
         self.software_list_frame = software_frame
         software_frame.grid(row=1, column=0, sticky="nsew", padx=(6, 4), pady=(0, 6))
         software_frame.grid_columnconfigure(0, weight=1)
         self._setup_scrollableframe_mousewheel(software_frame)
 
-        col_tool = ctk.CTkFrame(software_frame, fg_color="transparent")
-        col_tool.grid(row=0, column=0, sticky="ew", padx=2, pady=(0, 2))
-        col_tool.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(col_tool, text="Tabellenspalten", font=ctk.CTkFont(size=10, weight="bold")).grid(row=0, column=0, sticky="w")
-        reset_cols = ctk.CTkButton(
-            col_tool,
-            text="Spalten: Standard",
-            width=118,
-            height=20,
-            font=ctk.CTkFont(size=10),
-            command=self._reset_ui_columns_to_defaults,
-        )
-        reset_cols.grid(row=0, column=1, sticky="e")
-        self._attach_tooltip(reset_cols, "Setzt alle Spaltenbreiten auf die Standardwerte aus der Konfiguration.")
-
-        header = ctk.CTkFrame(software_frame, fg_color="transparent")
+        header = ctk.CTkFrame(software_frame, fg_color=self.ogx_colors["table"], height=28)
         self.software_header_frame = header
-        header.grid(row=1, column=0, sticky="ew", padx=2, pady=(0, 2))
+        header.pack_propagate(False)
+        header.grid(row=0, column=0, sticky="ew", padx=2, pady=(0, 1))
         self._header_grip_widgets.clear()
+        self._header_cell_frames.clear()
         _hf = ctk.CTkFont(size=10, weight="bold")
-        _titles = ("", "Programm", "Status", "Provider", "Installiert", "Verfuegbar", "Fortschritt")
-        for col in range(7):
-            cell = ctk.CTkFrame(header, fg_color="transparent")
-            cell.grid(row=0, column=col, sticky="nsew", padx=0, pady=0)
-            cell.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(cell, text=_titles[col], font=_hf, anchor="w").grid(row=0, column=0, sticky="w", padx=(4, 0))
-            if col < 6:
-                left_key = UI_COLUMN_KEYS[col]
-                right_key = UI_COLUMN_KEYS[col + 1]
-                grip = ctk.CTkFrame(cell, width=8, height=18, fg_color=self.ogx_colors["border"], corner_radius=2)
-                grip.grid(row=0, column=1, sticky="ns", padx=(2, 0))
+        _wmap = self._ui_column_widths
+        _titles = {"checkbox": "", "program": "Programm", "status": "Status",
+                   "provider": "Provider", "installed": "Installiert",
+                   "available": "Verfügbar", "progress": "Fortschritt"}
+        _grip_after = {"checkbox", "status", "provider", "installed", "available"}
+
+        for key in UI_COLUMN_KEYS:
+            title = _titles[key]
+            if key == "program":
+                cell = ctk.CTkFrame(header, fg_color="transparent")
+                cell.pack(side="left", fill="x", expand=True)
+            else:
+                cell = ctk.CTkFrame(header, fg_color="transparent", width=_wmap[key], height=26)
+                cell.pack_propagate(False)
+                cell.pack(side="left")
+            self._header_cell_frames[key] = cell
+            ctk.CTkLabel(cell, text=title, font=_hf, anchor="w").pack(side="left", padx=(6 if key == "checkbox" else 4, 0))
+            if key in _grip_after:
+                grip = ctk.CTkFrame(cell, width=5, fg_color=self.ogx_colors["border"], corner_radius=1)
+                grip.pack(side="right", fill="y", pady=4)
                 self._header_grip_widgets.append(grip)
-                grip.bind("<ButtonPress-1>", lambda e, lk=left_key, rk=right_key: self._on_column_resize_start(e, lk, rk))
-                grip.bind("<B1-Motion>", lambda e, lk=left_key, rk=right_key: self._on_column_resize_motion(e, lk, rk))
+                grip.bind("<ButtonPress-1>", lambda e, lk=key: self._on_column_resize_start(e, lk, ""))
+                grip.bind("<B1-Motion>", lambda e, lk=key: self._on_column_resize_motion(e, lk, ""))
                 grip.bind("<ButtonRelease-1>", lambda _e: self._on_column_resize_end())
-                grip.bind("<Double-Button-1>", lambda _e, lk=left_key: self._reset_one_column_width(lk))
-                grip.bind("<Enter>", lambda _e, w=grip: w.configure(fg_color=self.ogx_colors["accent"]))
-                grip.bind("<Leave>", lambda _e, w=grip: w.configure(fg_color=self.ogx_colors["border"]))
+                grip.bind("<Double-Button-1>", lambda _e, lk=key: self._reset_one_column_width(lk))
+                grip.bind("<Enter>", lambda _e, g=grip: g.configure(fg_color=self.ogx_colors["accent"]))
+                grip.bind("<Leave>", lambda _e, g=grip: g.configure(fg_color=self.ogx_colors["border"]))
                 try:
                     grip.configure(cursor="sb_h_double_arrow")
                 except Exception:
                     pass
 
-        for idx, software in enumerate(self.runtime.visible_catalog, start=2):
+        for idx, software in enumerate(self.runtime.visible_catalog, start=1):
             key = software.key
-            rowf = ctk.CTkFrame(software_frame, fg_color="transparent")
+            _row_bg = self.ogx_colors["table"] if idx % 2 == 0 else self.ogx_colors["table_alt"]
+            rowf = ctk.CTkFrame(software_frame, fg_color=_row_bg, height=28)
+            rowf.pack_propagate(False)
             rowf.grid(row=idx, column=0, sticky="ew", pady=1)
-            for c in range(7):
-                rowf.grid_columnconfigure(c, weight=0, minsize=self._ui_column_widths[UI_COLUMN_KEYS[c]])
-            rowf.grid_columnconfigure(1, weight=1)
             self.row_frames[key] = rowf
+            self._row_cell_frames[key] = {}
             self._setup_scroll_hover_target(rowf, self._software_list_wheel)
 
-            var = ctk.BooleanVar(value=False)
-            self.checkbox_vars[key] = var
             row_name = (
-                f"{software.display_name} (Server-Komponente (interner Installer))"
+                f"{software.display_name} (Server-Komponente)"
                 if key == "opentext"
-                else f"{software.display_name} (Webroot-Agent; Keycode aus Console)"
+                else f"{software.display_name} (Webroot-Agent)"
                 if key == "opentext_core_endpoint"
                 else software.display_name
             )
-            cb_w = self._ui_column_widths["checkbox"]
-            cb = ctk.CTkCheckBox(
-                rowf,
-                text="",
-                variable=var,
-                width=max(28, cb_w - 8),
-                checkbox_width=16,
-                checkbox_height=16,
-                font=ctk.CTkFont(size=10),
-            )
-            cb.grid(row=0, column=0, sticky="w", padx=2, pady=0)
+
+            # checkbox cell
+            cb_cell = ctk.CTkFrame(rowf, fg_color="transparent", width=_wmap["checkbox"], height=24)
+            cb_cell.pack_propagate(False)
+            cb_cell.pack(side="left")
+            self._row_cell_frames[key]["checkbox"] = cb_cell
+            var = ctk.BooleanVar(value=False)
+            self.checkbox_vars[key] = var
+            cb = ctk.CTkCheckBox(cb_cell, text="", variable=var, width=max(28, _wmap["checkbox"] - 8),
+                                 checkbox_width=16, checkbox_height=16, font=ctk.CTkFont(size=10))
+            cb.pack(side="left", padx=4)
             self.checkbox_widgets[key] = cb
 
-            nm = ctk.CTkLabel(rowf, text=row_name, anchor="w", font=ctk.CTkFont(size=10))
-            nm.grid(row=0, column=1, sticky="ew", padx=2, pady=0)
+            # program cell (flex)
+            prog_cell = ctk.CTkFrame(rowf, fg_color="transparent")
+            prog_cell.pack(side="left", fill="x", expand=True)
+            self._row_cell_frames[key]["program"] = prog_cell
+            nm = ctk.CTkLabel(prog_cell, text=row_name, anchor="w", font=ctk.CTkFont(size=10))
+            nm.pack(side="left", fill="x", expand=True, padx=(4, 2))
             self.program_name_labels[key] = nm
 
-            badge = ctk.CTkLabel(rowf, text="OFFEN", height=20, corner_radius=5, anchor="center", font=ctk.CTkFont(size=10))
-            badge.grid(row=0, column=2, padx=2, pady=0, sticky="ew")
+            # status cell
+            st_cell = ctk.CTkFrame(rowf, fg_color="transparent", width=_wmap["status"], height=24)
+            st_cell.pack_propagate(False)
+            st_cell.pack(side="left")
+            self._row_cell_frames[key]["status"] = st_cell
+            badge = ctk.CTkLabel(st_cell, text="OFFEN", height=20, corner_radius=5, anchor="center", font=ctk.CTkFont(size=10),
+                                 fg_color="#334155", text_color="#E2E8F0")
+            badge.pack(fill="x", padx=2, pady=2)
             self.badge_labels[key] = badge
 
-            pv = ctk.CTkLabel(rowf, text="—", anchor="w", font=ctk.CTkFont(size=10))
-            pv.grid(row=0, column=3, padx=2, pady=0, sticky="ew")
+            # provider cell
+            prov_cell = ctk.CTkFrame(rowf, fg_color="transparent", width=_wmap["provider"], height=24)
+            prov_cell.pack_propagate(False)
+            prov_cell.pack(side="left")
+            self._row_cell_frames[key]["provider"] = prov_cell
+            pv = ctk.CTkLabel(prov_cell, text="—", anchor="w", font=ctk.CTkFont(size=10))
+            pv.pack(side="left", padx=4)
             self.provider_labels[key] = pv
 
-            vi = ctk.CTkLabel(rowf, text="—", anchor="w", font=ctk.CTkFont(size=10))
-            vi.grid(row=0, column=4, padx=2, pady=0, sticky="ew")
+            # installed version cell
+            inst_cell = ctk.CTkFrame(rowf, fg_color="transparent", width=_wmap["installed"], height=24)
+            inst_cell.pack_propagate(False)
+            inst_cell.pack(side="left")
+            self._row_cell_frames[key]["installed"] = inst_cell
+            vi = ctk.CTkLabel(inst_cell, text="—", anchor="w", font=ctk.CTkFont(size=10))
+            vi.pack(side="left", padx=4)
             self.ver_inst_labels[key] = vi
 
-            va = ctk.CTkLabel(rowf, text="—", anchor="w", font=ctk.CTkFont(size=10))
-            va.grid(row=0, column=5, padx=2, pady=0, sticky="ew")
+            # available version cell
+            avail_cell = ctk.CTkFrame(rowf, fg_color="transparent", width=_wmap["available"], height=24)
+            avail_cell.pack_propagate(False)
+            avail_cell.pack(side="left")
+            self._row_cell_frames[key]["available"] = avail_cell
+            va = ctk.CTkLabel(avail_cell, text="—", anchor="w", font=ctk.CTkFont(size=10))
+            va.pack(side="left", padx=4)
             self.ver_avail_labels[key] = va
 
-            pb = ctk.CTkProgressBar(rowf, height=12)
-            pb.grid(row=0, column=6, padx=2, pady=0, sticky="ew")
+            # progress cell
+            pcell = ctk.CTkFrame(rowf, fg_color="transparent", width=_wmap["progress"], height=24)
+            pcell.pack_propagate(False)
+            pcell.pack(side="left")
+            self._row_cell_frames[key]["progress"] = pcell
+            pb = ctk.CTkProgressBar(pcell, height=10, width=max(40, _wmap["progress"] - 8))
+            pb.pack(side="left", padx=4, pady=7)
             pb.set(0)
+            self.row_progress_cells[key] = pcell
             self.row_progress_bars[key] = pb
 
             self.row_visible[key] = True
@@ -635,12 +774,14 @@ class UpdaterApp(ctk.CTk):
 
         log_frame = ctk.CTkFrame(content)
         self.log_frame = log_frame
-        log_frame.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(4, 6), pady=6)
+        log_frame.grid(row=0, column=2, rowspan=2, sticky="nsew", padx=(4, 6), pady=6)
         log_frame.grid_columnconfigure(0, weight=1)
         log_frame.grid_rowconfigure(0, weight=0)
         log_frame.grid_rowconfigure(1, weight=1)
 
         # Toolbar über dem Log (rechte Spalte), damit die Softwareliste mehr vertikale Fläche hat.
+        # In beschriftete Gruppen unterteilt (Software / System & Geräte / Setup / Berichte),
+        # damit die 16 Aktionen nicht mehr als eine unsortierte Knopf-Wand erscheinen.
         button_host = ctk.CTkFrame(log_frame, fg_color="transparent")
         self.button_host = button_host
         button_host.grid(row=0, column=0, sticky="ew", padx=2, pady=(0, 4))
@@ -650,118 +791,149 @@ class UpdaterApp(ctk.CTk):
         button_frame = ctk.CTkFrame(button_host, fg_color="transparent")
         self.button_frame = button_frame
         button_frame.grid(row=0, column=1, sticky="n")
+        button_frame.grid_columnconfigure(0, weight=1)
 
-        _btn_kw: dict = {"height": 20, "font": ctk.CTkFont(size=10)}
-        all_btn = ctk.CTkButton(button_frame, text="Alle Pakete", command=self._select_all, **_btn_kw)
-        all_btn.grid(row=0, column=0, padx=2, pady=1, sticky="ew")
+        _btn_kw: dict = {"height": 22, "font": ctk.CTkFont(size=10)}
+        _group_font = ctk.CTkFont(size=9, weight="bold")
+
+        def _new_toolbar_group(title: str, group_row: int) -> ctk.CTkFrame:
+            group = ctk.CTkFrame(button_frame, corner_radius=8)
+            group.grid(row=group_row, column=0, sticky="ew", pady=(0, 8))
+            ctk.CTkLabel(
+                group,
+                text=title.upper(),
+                font=_group_font,
+                text_color=self.ogx_colors["accent"],
+                anchor="w",
+            ).grid(row=0, column=0, sticky="w", padx=8, pady=(6, 3))
+            sep = ctk.CTkFrame(group, height=1, fg_color=self.ogx_colors["border"])
+            sep.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 6))
+            grid_frame = ctk.CTkFrame(group, fg_color="transparent")
+            grid_frame.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 8))
+            return grid_frame
+
+        # --- Gruppe: Software-Aktionen ---
+        sw_grid = _new_toolbar_group("Software", 0)
+        all_btn = ctk.CTkButton(sw_grid, text="Alle Pakete", command=self._select_all, **_btn_kw)
         self._attach_tooltip(all_btn, "Markiert alle aktuell sichtbaren Programme in der Liste.")
-        self.check_btn = ctk.CTkButton(button_frame, text="Prüfen", command=self._scan_selected, **_btn_kw)
-        self.check_btn.grid(row=0, column=1, padx=2, pady=1, sticky="ew")
+        self.check_btn = ctk.CTkButton(sw_grid, text="Prüfen", command=self._scan_selected, **_btn_kw)
         self._attach_tooltip(self.check_btn, "Prüft ausgewählte Programme auf installiert/Update verfügbar.")
-        self.install_btn = ctk.CTkButton(button_frame, text="Install / Update", command=self._install_selected, **_btn_kw)
-        self.install_btn.grid(row=0, column=2, padx=2, pady=1, sticky="ew")
+        self.install_btn = ctk.CTkButton(sw_grid, text="Install / Update", command=self._install_selected, **_btn_kw)
         self._attach_tooltip(self.install_btn, "Installiert oder aktualisiert ausgewählte Programme gemäß Provider-Kette.")
-        self.remove_btn = ctk.CTkButton(button_frame, text="Ausgewählte entfernen", command=self._remove_selected, **_btn_kw)
-        self.remove_btn.grid(row=0, column=3, padx=2, pady=1, sticky="ew")
+        self.remove_btn = ctk.CTkButton(sw_grid, text="Ausgewählte entfernen", command=self._remove_selected, **_btn_kw)
         self._attach_tooltip(self.remove_btn, "Deinstalliert ausgewählte Programme inklusive Deep-Cleanup von Resten.")
-        save_log_btn = ctk.CTkButton(button_frame, text="Log speichern", command=self._save_log, **_btn_kw)
-        save_log_btn.grid(row=1, column=0, padx=2, pady=1, sticky="ew")
-        self._attach_tooltip(save_log_btn, "Speichert das aktuelle Laufprotokoll als Datei.")
-        self.report_btn = ctk.CTkButton(button_frame, text="CSV Report öffnen", command=self._open_report_folder, **_btn_kw)
-        self.report_btn.grid(row=1, column=1, padx=2, pady=1, sticky="ew")
-        self._attach_tooltip(self.report_btn, "Oeffnet den Report-Ordner mit CSV/PDF-Ergebnissen.")
-        self.settings_btn = ctk.CTkButton(button_frame, text="Einstellungen", command=self._open_settings_dialog, **_btn_kw)
-        self.settings_btn.grid(row=1, column=2, padx=2, pady=1, sticky="ew")
-        self._attach_tooltip(self.settings_btn, "Öffnet die Konfiguration für Provider, Installer und Suchmuster.")
-        about_btn = ctk.CTkButton(button_frame, text="About", command=self._show_about_dialog, **_btn_kw)
-        about_btn.grid(row=1, column=3, padx=2, pady=1, sticky="ew")
-        self._attach_tooltip(about_btn, "Zeigt Versions-, Build- und Runtime-Informationen.")
-        self.select_missing_btn = ctk.CTkButton(button_frame, text="Nur fehlend", command=self._select_missing_only, **_btn_kw)
-        self.select_missing_btn.grid(row=2, column=0, padx=2, pady=(0, 1), sticky="ew")
-        self.select_updates_btn = ctk.CTkButton(button_frame, text="Nur Updates", command=self._select_updates_only, **_btn_kw)
-        self.select_updates_btn.grid(row=2, column=1, padx=2, pady=(0, 1), sticky="ew")
-        self.patch_run_btn = ctk.CTkButton(button_frame, text="Standard Patch Run", command=self._standard_patch_run, **_btn_kw)
-        self.patch_run_btn.grid(row=2, column=2, padx=2, pady=(0, 1), sticky="ew")
+        self.select_missing_btn = ctk.CTkButton(sw_grid, text="Nur fehlend", command=self._select_missing_only, **_btn_kw)
+        self.select_updates_btn = ctk.CTkButton(sw_grid, text="Nur Updates", command=self._select_updates_only, **_btn_kw)
+        self.patch_run_btn = ctk.CTkButton(
+            sw_grid,
+            text="Standard Patch Run",
+            command=self._standard_patch_run,
+            fg_color=self.ogx_colors["gold"],
+            hover_color=self.ogx_colors["gold_hover"],
+            text_color=self.ogx_colors["bg"],
+            **_btn_kw,
+        )
         self._attach_tooltip(self.patch_run_btn, "Wählt automatisch Programme mit fehlender Installation oder verfügbarem Update.")
-        self.system_tools_btn = ctk.CTkButton(button_frame, text="Systemverwaltung", command=self._open_system_tools_dialog, **_btn_kw)
-        self.system_tools_btn.grid(row=2, column=3, padx=2, pady=(0, 1), sticky="ew")
+        sw_buttons = [
+            all_btn, self.check_btn, self.install_btn, self.remove_btn,
+            self.select_missing_btn, self.select_updates_btn, self.patch_run_btn,
+        ]
+        self._toolbar_groups.append(("Software", sw_grid, sw_buttons))
+
+        # --- Gruppe: System & Geräte ---
+        sys_grid = _new_toolbar_group("System & Geräte", 1)
+        self.system_tools_btn = ctk.CTkButton(sys_grid, text="Systemverwaltung", command=self._open_system_tools_dialog, **_btn_kw)
         self._attach_tooltip(self.system_tools_btn, "Öffnet Safe-Systemtools für Benutzerverwaltung, Profil-Migration und Windows-Updates.")
         self.energy_screensaver_btn = ctk.CTkButton(
-            button_frame,
+            sys_grid,
             text="Energie & Bildschirmschoner",
             command=self._open_system_settings_dialog,
             **_btn_kw,
         )
-        self.energy_screensaver_btn.grid(row=3, column=2, padx=2, pady=(0, 1), sticky="ew")
         self._attach_tooltip(
             self.energy_screensaver_btn,
             "Deckel zu = keine Aktion, Standby aus, Bildschirmschoner 15 Min. "
             "Energie: aktives Schema (powercfg); Schoner: aktueller Benutzer. Admin oft nötig.",
         )
         self.device_settings_btn = ctk.CTkButton(
-            button_frame,
+            sys_grid,
             text="Geräte-Einstellungen",
-            command=self._open_system_settings_dialog,
+            command=self._open_device_settings_dialog,
+            fg_color=self.ogx_colors["danger"],
+            hover_color=self.ogx_colors["danger_hover"],
             **_btn_kw,
         )
-        self.device_settings_btn.grid(row=3, column=3, padx=2, pady=(0, 1), sticky="ew")
         self._attach_tooltip(
             self.device_settings_btn,
-            "Öffnet dieselbe Energie-Übersicht (Alternative Schnelltaste).",
+            "Computernamen ändern und Windows-Updates verwalten.",
         )
+        sys_buttons = [self.system_tools_btn, self.energy_screensaver_btn, self.device_settings_btn]
+        self._toolbar_groups.append(("System & Geräte", sys_grid, sys_buttons))
+
+        # --- Gruppe: Setup (Chocolatey/WinGet) ---
+        setup_grid = _new_toolbar_group("Setup", 2)
         self.install_choco_btn = ctk.CTkButton(
-            button_frame, text="Chocolatey installieren", command=self._bootstrap_chocolatey, **_btn_kw
+            setup_grid, text="Chocolatey installieren", command=self._bootstrap_chocolatey, **_btn_kw
         )
-        self.install_choco_btn.grid(row=3, column=0, padx=2, pady=(0, 1), sticky="ew")
         self._attach_tooltip(
             self.install_choco_btn,
             "Installiert Chocolatey per offiziellem PowerShell-Skript (Internet, Admin empfohlen).",
         )
         self.install_winget_btn = ctk.CTkButton(
-            button_frame, text="WinGet installieren", command=self._bootstrap_winget, **_btn_kw
+            setup_grid, text="WinGet installieren", command=self._bootstrap_winget, **_btn_kw
         )
-        self.install_winget_btn.grid(row=3, column=1, padx=2, pady=(0, 1), sticky="ew")
         self._attach_tooltip(
             self.install_winget_btn,
             "Installiert die App-Installer-Paketquelle (aka.ms/getwinget). Nach Neustart oder neuer Shell oft verfügbar.",
         )
-        self._toolbar_buttons = [
-            all_btn,
-            self.check_btn,
-            self.install_btn,
-            self.remove_btn,
-            save_log_btn,
-            self.report_btn,
-            self.settings_btn,
-            about_btn,
-            self.select_missing_btn,
-            self.select_updates_btn,
-            self.patch_run_btn,
-            self.system_tools_btn,
-            self.energy_screensaver_btn,
-            self.device_settings_btn,
-            self.install_choco_btn,
-            self.install_winget_btn,
-        ]
+        setup_buttons = [self.install_choco_btn, self.install_winget_btn]
+        self._toolbar_groups.append(("Setup", setup_grid, setup_buttons))
+
+        # --- Gruppe: Berichte & Sonstiges ---
+        rep_grid = _new_toolbar_group("Berichte & Sonstiges", 3)
+        save_log_btn = ctk.CTkButton(rep_grid, text="Log speichern", command=self._save_log, **_btn_kw)
+        self._attach_tooltip(save_log_btn, "Speichert das aktuelle Laufprotokoll als Datei.")
+        self.report_btn = ctk.CTkButton(rep_grid, text="CSV Report öffnen", command=self._open_report_folder, **_btn_kw)
+        self._attach_tooltip(self.report_btn, "Oeffnet den Report-Ordner mit CSV/PDF-Ergebnissen.")
+        self.settings_btn = ctk.CTkButton(rep_grid, text="Einstellungen", command=self._open_settings_dialog, **_btn_kw)
+        self._attach_tooltip(self.settings_btn, "Öffnet die Konfiguration für Provider, Installer und Suchmuster.")
+        about_btn = ctk.CTkButton(rep_grid, text="About", command=self._show_about_dialog, **_btn_kw)
+        self._attach_tooltip(about_btn, "Zeigt Versions-, Build- und Runtime-Informationen.")
+        rep_buttons = [save_log_btn, self.report_btn, self.settings_btn, about_btn]
+        self._toolbar_groups.append(("Berichte & Sonstiges", rep_grid, rep_buttons))
+
+        self._toolbar_buttons = sw_buttons + sys_buttons + setup_buttons + rep_buttons
         if platform.system() != "Windows":
             self.energy_screensaver_btn.configure(state="disabled")
-            self.device_settings_btn.configure(state="disabled")
 
         self.log_box = ctk.CTkTextbox(log_frame, wrap="word", font=ctk.CTkFont(size=10))
         self.log_box.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
         self._setup_scroll_hover_target(self.log_box, self._logbox_wheel)
 
         self.history_frame = ctk.CTkFrame(self)
-        self.history_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 4))
+        self.history_frame.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 4))
         self.history_frame.grid_columnconfigure(1, weight=1)
         self.history_frame.grid_columnconfigure(2, weight=0)
+        history_split_grip = ctk.CTkFrame(self.history_frame, height=5, fg_color=self.ogx_colors["border"], corner_radius=1)
+        history_split_grip.grid(row=0, column=0, columnspan=3, sticky="ew", padx=40, pady=(4, 0))
+        try:
+            history_split_grip.configure(cursor="sb_v_double_arrow")
+        except Exception:
+            pass
+        history_split_grip.bind("<ButtonPress-1>", self._on_history_split_start)
+        history_split_grip.bind("<B1-Motion>", self._on_history_split_motion)
+        history_split_grip.bind("<ButtonRelease-1>", self._on_history_split_end)
+        history_split_grip.bind("<Double-Button-1>", self._on_history_split_reset)
+        history_split_grip.bind("<Enter>", lambda _e: history_split_grip.configure(fg_color=self.ogx_colors["accent"]))
+        history_split_grip.bind("<Leave>", lambda _e: history_split_grip.configure(fg_color=self.ogx_colors["border"]))
+        self._attach_tooltip(history_split_grip, "Ziehen, um den Report-Verlauf höher/niedriger zu machen. Doppelklick setzt zurück.")
         ctk.CTkLabel(self.history_frame, text="Letzte Läufe (max. 10 Reports: CSV / PDF)", font=ctk.CTkFont(size=10, weight="bold")).grid(
-            row=0, column=0, sticky="w", padx=6, pady=6
+            row=1, column=0, sticky="w", padx=6, pady=6
         )
         ctk.CTkButton(
             self.history_frame, text="Report-Ordner öffnen", command=self._open_reports_dir, height=22, font=ctk.CTkFont(size=10)
         ).grid(
-            row=0, column=1, sticky="e", padx=6, pady=6
+            row=1, column=1, sticky="e", padx=6, pady=6
         )
         self.history_toggle_btn = ctk.CTkButton(
             self.history_frame,
@@ -771,14 +943,14 @@ class UpdaterApp(ctk.CTk):
             font=ctk.CTkFont(size=10),
             command=self._toggle_history_section,
         )
-        self.history_toggle_btn.grid(row=0, column=2, sticky="e", padx=(0, 6), pady=6)
-        self.history_scroll = ctk.CTkScrollableFrame(self.history_frame, height=48)
-        self.history_scroll.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        self.history_toggle_btn.grid(row=1, column=2, sticky="e", padx=(0, 6), pady=6)
+        self.history_scroll = ctk.CTkScrollableFrame(self.history_frame, height=self._history_scroll_height)
+        self.history_scroll.grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
         self.history_scroll.grid_columnconfigure(0, weight=1)
         self._set_history_details_visible(False)
 
         bottom_frame = ctk.CTkFrame(self)
-        bottom_frame.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 4))
+        bottom_frame.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 4))
         bottom_frame.grid_columnconfigure(0, weight=1)
         bottom_frame.grid_columnconfigure(1, weight=0)
 
@@ -878,10 +1050,30 @@ class UpdaterApp(ctk.CTk):
             return
         label.configure(text="bereit", fg_color="#2c5a4a", text_color="#e6f7ef")
 
+    def _set_device_tab_status(self, tab_name: str, state: str) -> None:
+        label = self._device_settings_status_labels.get(tab_name)
+        if label is None:
+            return
+        normalized = state.strip().lower()
+        if normalized == "läuft":
+            label.configure(text="läuft", fg_color="#7a6a2b", text_color="#f5f1e0")
+            return
+        if normalized == "fehler":
+            label.configure(text="fehler", fg_color="#7a3240", text_color="#f8e9ed")
+            return
+        label.configure(text="bereit", fg_color="#2c5a4a", text_color="#e6f7ef")
+
     def _on_window_resize(self, event) -> None:
         if event.widget is not self:
             return
-        self._apply_responsive_layout(int(event.width), int(event.height))
+        if self._resize_after_id is not None:
+            try:
+                self.after_cancel(self._resize_after_id)
+            except Exception:
+                pass
+        self._resize_after_id = self.after(
+            80, lambda w=int(event.width), h=int(event.height): self._apply_responsive_layout(w, h)
+        )
 
     def _toolbar_reference_width(self, window_width: int) -> int:
         """Toolbar liegt über dem Log; Spaltenanzahl nach Log-Breite, nicht nach voller Fensterbreite."""
@@ -898,54 +1090,31 @@ class UpdaterApp(ctk.CTk):
         return max(360, int(window_width * 0.28))
 
     def _apply_toolbar_layout(self, layout_w: int) -> None:
-        bf = self.button_frame
-        if bf is None or not self._toolbar_buttons:
+        if self.button_frame is None or not self._toolbar_groups:
             return
-        # Breit: 6×2, mittel: 4×4, schmal: 2×… — bezogen auf Log-Spalte (button_host im log_frame).
+        # Breit: 6×, mittel: 4×, schmal: 2× Spalten pro Gruppe — bezogen auf Log-Spalte (button_host im log_frame).
         if layout_w >= 1240:
-            cols = 6
+            cols_pref = 6
         elif layout_w >= 720:
-            cols = 4
+            cols_pref = 4
         else:
-            cols = 2
-        if self._toolbar_cols == cols:
+            cols_pref = 2
+        if self._toolbar_cols == cols_pref:
             return
-        self._toolbar_cols = cols
-        px, py = 2, 1
-        for c in range(6):
-            bf.grid_columnconfigure(c, weight=1 if c < cols else 0, minsize=0)
-        for btn in self._toolbar_buttons:
-            btn.grid_forget()
-        for i, btn in enumerate(self._toolbar_buttons):
-            r, c = divmod(i, cols)
-            btn.grid(row=r, column=c, padx=px, pady=py, sticky="ew")
+        self._toolbar_cols = cols_pref
+        px, py = 4, 3
+        for _title, grid_frame, buttons in self._toolbar_groups:
+            cols = max(1, min(cols_pref, len(buttons)))
+            for c in range(6):
+                grid_frame.grid_columnconfigure(c, weight=1 if c < cols else 0, minsize=0)
+            for btn in buttons:
+                btn.grid_forget()
+            for i, btn in enumerate(buttons):
+                r, c = divmod(i, cols)
+                btn.grid(row=r, column=c, padx=px, pady=py, sticky="ew")
 
     def _apply_filter_bar_layout(self, layout_w: int) -> None:
-        fb = self.filter_bar_frame
-        if (
-            fb is None
-            or self.filter_segment is None
-            or self.search_entry is None
-            or self._filter_heading is None
-            or self._search_heading is None
-        ):
-            return
-        stacked = layout_w < 640
-        if self._filter_bar_stacked is not None and stacked == self._filter_bar_stacked:
-            return
-        self._filter_bar_stacked = stacked
-        for w in (self._filter_heading, self.filter_segment, self._search_heading, self.search_entry):
-            w.grid_forget()
-        if stacked:
-            self._filter_heading.grid(row=0, column=0, sticky="w", padx=6, pady=2)
-            self.filter_segment.grid(row=0, column=1, columnspan=3, sticky="ew", padx=6, pady=2)
-            self._search_heading.grid(row=1, column=0, sticky="w", padx=6, pady=(4, 2))
-            self.search_entry.grid(row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=(0, 2))
-        else:
-            self._filter_heading.grid(row=0, column=0, padx=6, pady=4, sticky="w")
-            self.filter_segment.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
-            self._search_heading.grid(row=0, column=2, padx=(12, 4), pady=4, sticky="w")
-            self.search_entry.grid(row=0, column=3, sticky="ew", padx=6, pady=4)
+        pass  # filter bar uses pack — no responsive relayout needed
 
     def _apply_responsive_layout(self, width: int, height: int) -> None:
         self._apply_top_section_layout(width, height)
@@ -988,25 +1157,36 @@ class UpdaterApp(ctk.CTk):
 
     def _apply_software_column_widths(self) -> None:
         wmap = self._ui_column_widths
-        header = self.software_header_frame
-        if header is not None:
-            for c, key in enumerate(UI_COLUMN_KEYS):
-                header.grid_columnconfigure(c, weight=0, minsize=wmap[key])
-            header.grid_columnconfigure(1, weight=1)
-        for frame in self.row_frames.values():
-            for c, key in enumerate(UI_COLUMN_KEYS):
-                frame.grid_columnconfigure(c, weight=0, minsize=wmap[key])
-            frame.grid_columnconfigure(1, weight=1)
+        _fixed_keys = ("checkbox", "status", "provider", "installed", "available", "progress")
+        # Update header cells
+        for key in _fixed_keys:
+            cell = self._header_cell_frames.get(key)
+            if cell is not None:
+                try:
+                    cell.configure(width=wmap[key])
+                except Exception:
+                    pass
+        # Update all data row cells
+        for row_cells in self._row_cell_frames.values():
+            for key in _fixed_keys:
+                cell = row_cells.get(key)
+                if cell is not None:
+                    try:
+                        cell.configure(width=wmap[key])
+                    except Exception:
+                        pass
+        # Checkbox widget width
         cb_w = wmap["checkbox"]
-        for key, cb in self.checkbox_widgets.items():
+        for cb in self.checkbox_widgets.values():
             try:
                 cb.configure(width=max(28, cb_w - 8))
             except Exception:
                 pass
-        wrap_prog = max(120, wmap.get("program", 200) * 4)
-        for lb in self.program_name_labels.values():
+        # Progress bar inner width
+        progress_w = wmap["progress"]
+        for pb in self.row_progress_bars.values():
             try:
-                lb.configure(wraplength=wrap_prog)
+                pb.configure(width=max(40, progress_w - 8))
             except Exception:
                 pass
 
@@ -1029,8 +1209,8 @@ class UpdaterApp(ctk.CTk):
         if total <= avail:
             return
         over = total - avail
-        # Shrink neutral columns first, keep progress adjustable and not locked by scrollbar.
-        order = ("program", "provider", "installed", "available", "status", "progress", "checkbox")
+        # On narrow windows, shrink non-program columns first, then program last.
+        order = ("provider", "installed", "available", "status", "progress", "checkbox", "program")
         for key in order:
             if over <= 0:
                 break
@@ -1048,7 +1228,7 @@ class UpdaterApp(ctk.CTk):
 
     def _on_column_resize_motion(self, event: object, left_key: str, right_key: str) -> None:
         drag = self._col_resize_drag
-        if drag is None or drag[0] != left_key or drag[1] != right_key:
+        if drag is None or drag[0] != left_key:
             return
         x0 = drag[2]
         cur = int(getattr(event, "x_root", x0))
@@ -1056,25 +1236,8 @@ class UpdaterApp(ctk.CTk):
         if delta == 0:
             return
         self._col_resize_drag = (left_key, right_key, cur)
-        lo_l = MIN_UI_COLUMNS[left_key]
-        lo_r = MIN_UI_COLUMNS[right_key]
-        wl = self._ui_column_widths[left_key]
-        wr = self._ui_column_widths[right_key]
-        new_l = wl + delta
-        new_r = wr - delta
-        if new_l < lo_l:
-            shift = lo_l - new_l
-            new_l = lo_l
-            new_r = wr - (delta - shift)
-        if new_r < lo_r:
-            shift = new_r - lo_r
-            new_r = lo_r
-            new_l = wl + (delta + shift)
-        new_l = max(lo_l, new_l)
-        new_r = max(lo_r, new_r)
-        self._ui_column_widths[left_key] = int(new_l)
-        self._ui_column_widths[right_key] = int(new_r)
-        self._fit_columns_to_available_width()
+        new_w = max(MIN_UI_COLUMNS[left_key], self._ui_column_widths[left_key] + delta)
+        self._ui_column_widths[left_key] = int(new_w)
         self._apply_software_column_widths()
 
     def _on_column_resize_end(self) -> None:
@@ -1083,7 +1246,7 @@ class UpdaterApp(ctk.CTk):
             try:
                 cfg = get_config_dict(self.logger)
                 cfg["ui_columns"] = {k: int(self._ui_column_widths[k]) for k in UI_COLUMN_KEYS}
-                save_config_dict(cfg, self.logger)
+                save_config_dict(cfg, self.logger, backup=False)
             except Exception as exc:  # pylint: disable=broad-except
                 self.logger.warning("ui_columns speichern fehlgeschlagen: %s", exc)
 
@@ -1097,6 +1260,62 @@ class UpdaterApp(ctk.CTk):
         self._fit_columns_to_available_width()
         self._apply_software_column_widths()
         self._on_column_resize_end()
+
+    def _on_content_split_start(self, event: object) -> None:
+        try:
+            start_w = int(self.software_list_frame.winfo_width())
+        except Exception:
+            start_w = 0
+        self._content_split_drag = (int(getattr(event, "x_root", 0)), max(start_w, 1))
+
+    def _on_content_split_motion(self, event: object) -> None:
+        drag = self._content_split_drag
+        if drag is None or self.content_frame is None:
+            return
+        x0, start_w = drag
+        cur_x = int(getattr(event, "x_root", x0))
+        delta = cur_x - x0
+        self._content_split_override_px = max(240, start_w + delta)
+        w0, w1 = self._content_col_weights(False)
+        self.content_frame.grid_columnconfigure(0, weight=w0)
+        self.content_frame.grid_columnconfigure(2, weight=w1)
+
+    def _on_content_split_end(self, _event: object = None) -> None:
+        self._content_split_drag = None
+
+    def _on_content_split_reset(self, _event: object = None) -> None:
+        self._content_split_override_px = None
+        self._content_split_drag = None
+        self._single_column_mode = None  # erzwingt vollstaendiges Neuanwenden der Standard-Gewichte
+        try:
+            width = int(self.winfo_width())
+        except Exception:
+            width = 1360
+        self._apply_width_layout(width)
+
+    def _on_history_split_start(self, event: object) -> None:
+        self._history_split_drag = (int(getattr(event, "y_root", 0)), int(self._history_scroll_height))
+
+    def _on_history_split_motion(self, event: object) -> None:
+        drag = self._history_split_drag
+        if drag is None or self.history_scroll is None:
+            return
+        y0, start_h = drag
+        cur_y = int(getattr(event, "y_root", y0))
+        # Griff über dem Panel: nach oben ziehen vergroessert das Panel, daher invertiertes Delta.
+        delta = y0 - cur_y
+        new_h = max(32, min(320, start_h + delta))
+        self._history_scroll_height = new_h
+        self.history_scroll.configure(height=new_h)
+
+    def _on_history_split_end(self, _event: object = None) -> None:
+        self._history_split_drag = None
+
+    def _on_history_split_reset(self, _event: object = None) -> None:
+        self._history_split_drag = None
+        self._history_scroll_height = 48
+        if self.history_scroll is not None:
+            self.history_scroll.configure(height=48)
 
     def _update_wrap_lengths(self, width: int) -> None:
         health_wrap = max(180, min(1500, width - 48))
@@ -1138,15 +1357,21 @@ class UpdaterApp(ctk.CTk):
     def _style_special_action_buttons(self) -> None:
         if self.energy_screensaver_btn is not None:
             self.energy_screensaver_btn.configure(
-                fg_color="#2f7d4f",
-                hover_color="#25643f",
-                text_color="#e8fff0",
+                fg_color="#22C55E",
+                hover_color="#16A34A",
+                text_color="#052e16",
             )
         if self.system_tools_btn is not None:
             self.system_tools_btn.configure(
-                fg_color="#8a2d3f",
-                hover_color="#6f2432",
-                text_color="#ffeef2",
+                fg_color=self.ogx_colors["danger"],
+                hover_color=self.ogx_colors["danger_hover"],
+                text_color="#fff0f0",
+            )
+        if self.device_settings_btn is not None:
+            self.device_settings_btn.configure(
+                fg_color=self.ogx_colors["danger"],
+                hover_color=self.ogx_colors["danger_hover"],
+                text_color="#fff0f0",
             )
 
     def _set_health_details_visible(self, visible: bool) -> None:
@@ -1161,6 +1386,20 @@ class UpdaterApp(ctk.CTk):
     def _toggle_health_details(self) -> None:
         self._health_details_expanded = not self._health_details_expanded
         self._set_health_details_visible((not bool(self._compact_mode)) and self._health_details_expanded)
+
+    def _content_col_weights(self, want_wide_split: bool) -> tuple[int, int]:
+        """Liefert (Softwareliste, Log) Spaltengewichte — respektiert eine per Griff gezogene Nutzer-Aufteilung."""
+        if self._content_split_override_px is not None and self.content_frame is not None:
+            try:
+                total = max(int(self.content_frame.winfo_width()) - 6, 0)
+            except Exception:
+                total = 0
+            if total < 400:
+                total = 1200
+            w0 = max(240, min(total - 200, int(self._content_split_override_px)))
+            w1 = max(120, total - w0)
+            return w0, w1
+        return (7, 1) if want_wide_split else (5, 1)
 
     def _apply_width_layout(self, width: int) -> None:
         # Ab dieser Breite: Log rechts neben Filter+Liste (gleiche Zeilenhöhe wie Software — „rutscht nach oben“).
@@ -1182,48 +1421,74 @@ class UpdaterApp(ctk.CTk):
         if not layout_mode_changed:
             if single_column:
                 return
-            if not split_only_changed:
+            if not split_only_changed and self._content_split_override_px is None:
                 return
             self._log_wide_split_active = want_wide_split
-            if want_wide_split:
-                content.grid_columnconfigure(0, weight=7)
-                content.grid_columnconfigure(1, weight=1)
-            else:
-                content.grid_columnconfigure(0, weight=5)
-                content.grid_columnconfigure(1, weight=1)
+            w0, w1 = self._content_col_weights(want_wide_split)
+            content.grid_columnconfigure(0, weight=w0)
+            content.grid_columnconfigure(2, weight=w1)
             return
 
         self._single_column_mode = single_column
         self._log_wide_split_active = want_wide_split if not single_column else None
 
         if single_column:
+            if self.content_split_grip is not None:
+                self.content_split_grip.grid_remove()
             content.grid_columnconfigure(0, weight=1)
-            content.grid_columnconfigure(1, weight=0)
+            content.grid_columnconfigure(2, weight=0)
             content.grid_rowconfigure(0, weight=0)
             content.grid_rowconfigure(1, weight=2, minsize=160)
             content.grid_rowconfigure(2, weight=1, minsize=120)
-            self.filter_bar_frame.grid(row=0, column=0, columnspan=1, sticky="ew", padx=6, pady=(4, 4))
+            self.filter_bar_frame.grid(row=0, column=0, columnspan=1, sticky="ew", padx=6, pady=(2, 2))
             self.software_list_frame.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 4))
             self.log_frame.grid(row=2, column=0, rowspan=1, sticky="nsew", padx=6, pady=(0, 6))
         else:
-            if want_wide_split:
-                content.grid_columnconfigure(0, weight=7)
-                content.grid_columnconfigure(1, weight=1)
-            else:
-                content.grid_columnconfigure(0, weight=5)
-                content.grid_columnconfigure(1, weight=1)
+            if self.content_split_grip is not None:
+                self.content_split_grip.grid()
+            w0, w1 = self._content_col_weights(want_wide_split)
+            content.grid_columnconfigure(0, weight=w0)
+            content.grid_columnconfigure(2, weight=w1)
             content.grid_rowconfigure(0, weight=0)
             content.grid_rowconfigure(1, weight=1, minsize=200)
             content.grid_rowconfigure(2, weight=0, minsize=0)
-            self.filter_bar_frame.grid(row=0, column=0, columnspan=1, sticky="ew", padx=(6, 4), pady=(4, 4))
+            self.filter_bar_frame.grid(row=0, column=0, columnspan=1, sticky="ew", padx=(6, 4), pady=(2, 2))
             self.software_list_frame.grid(row=1, column=0, sticky="nsew", padx=(6, 4), pady=(0, 6))
-            self.log_frame.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(4, 6), pady=6)
+            self.log_frame.grid(row=0, column=2, rowspan=2, sticky="nsew", padx=(4, 6), pady=6)
 
     def _on_filter_change(self, value: str) -> None:
+        self._active_filter_mode = value
+        for mode, btn in self._filter_count_labels.items():
+            active = mode == value
+            try:
+                btn.configure(
+                    fg_color=self.ogx_colors["accent"] if active else self.ogx_colors["panel_alt"],
+                    hover_color=self.ogx_colors["accent_hover"] if active else self.ogx_colors["border"],
+                )
+            except Exception:
+                pass
         self._sync_row_visibility()
 
     def _on_search_change(self, *_args: object) -> None:
         self._sync_row_visibility()
+
+    def _update_filter_counts(self) -> None:
+        counts: dict[str, int] = {"Alle": 0, "Updates": 0, "Fehlend": 0, "Fehler": 0}
+        for key in self.row_frames:
+            st = self.current_states.get(key)
+            s = st.status if st else "Nicht geprueft"
+            counts["Alle"] += 1
+            if s == "Update verfuegbar":
+                counts["Updates"] += 1
+            elif s == "Nicht installiert":
+                counts["Fehlend"] += 1
+            elif "Fehler" in s and s not in ("Quelle erforderlich", "PRUEFT"):
+                counts["Fehler"] += 1
+        for mode, btn in self._filter_count_labels.items():
+            try:
+                btn.configure(text=f"{mode}  {counts[mode]}")
+            except Exception:
+                pass
 
     @staticmethod
     def _set_health_caption(lb: ctk.CTkLabel | None, text: str) -> None:
@@ -1231,10 +1496,7 @@ class UpdaterApp(ctk.CTk):
             lb.configure(text=text or "—")
 
     def _current_filter_mode(self) -> str:
-        if self.filter_segment is None:
-            return "Alle"
-        v = self.filter_segment.get()
-        return str(v)
+        return getattr(self, "_active_filter_mode", "Alle")
 
     def _row_matches_filter(self, key: str) -> bool:
         mode = self._current_filter_mode()
@@ -1264,7 +1526,7 @@ class UpdaterApp(ctk.CTk):
     def _filters_relaxed(self) -> bool:
         if (self.search_var.get() or "").strip():
             return False
-        return self._current_filter_mode() == "Alle"
+        return getattr(self, "_active_filter_mode", "Alle") == "Alle"
 
     def _sync_row_visibility(self) -> None:
         relaxed = self._filters_relaxed()
@@ -1299,28 +1561,28 @@ class UpdaterApp(ctk.CTk):
     def _status_badge_style(state: SoftwareState) -> tuple[str, str, str]:
         st = state.status
         if st == "PRUEFT":
-            return "PRUEFT", "#8a6a2a", "#fff8e6"
+            return "PRUEFT",  "#1E3A8A", "#BFDBFE"
         if st == "Quelle erforderlich":
-            return "QUELLE", "#7a6a2b", "#f5f1e0"
+            return "QUELLE",  "#92400E", "#FFEDD5"
         if st == "Warnung":
-            return "HINWEIS", "#6b5c38", "#f8f5ed"
+            return "HINWEIS", "#78350F", "#FDE68A"
         if "fehler" in st.lower():
-            return "FEHLER", "#7a3240", "#f8e9ed"
+            return "FEHLER",  "#7F1D1D", "#FECACA"
         if "dry-run" in st.lower():
-            return "DRY-RUN", "#756847", "#f7f2e6"
+            return "DRY-RUN", "#44403C", "#E7E5E4"
         if st == "Update verfuegbar":
-            return "UPDATE", "#6e5d2f", "#f6f0df"
+            return "UPDATE",  "#78350F", "#FDE68A"
         if st == "Nicht installiert":
-            return "FEHLT", "#4b5563", "#e8edf5"
+            return "FEHLT",   "#334155", "#E2E8F0"
         if st == "Manuelle Pruefung noetig" or "manuelle" in st.lower():
-            return "PRUEFEN", "#6f6138", "#f6f1e2"
+            return "PRUEFEN", "#78350F", "#FDE68A"
         if st == "Installiert":
-            return "OK", "#2c5a4a", "#e6f7ef"
+            return "OK",      "#14532D", "#BBF7D0"
         if st == "Aktuell":
-            return "AKTUELL", "#244c40", "#e4f4ee"
+            return "AKTUELL", "#14532D", "#BBF7D0"
         if st == "Nicht geprueft":
-            return "OFFEN", "#405164", "#e7eef6"
-        return st[:10].upper(), "#3f4a5b", "#e7eef6"
+            return "OFFEN",   "#334155", "#E2E8F0"
+        return st[:10].upper(), "#334155", "#E2E8F0"
 
     def _run_startup_checks(self) -> None:
         self._set_actions_enabled(False)
@@ -1501,6 +1763,184 @@ class UpdaterApp(ctk.CTk):
         finally:
             self._set_actions_enabled(True)
 
+    def _open_device_settings_dialog(self) -> None:
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Geräte-Einstellungen")
+        dialog.geometry("900x640")
+        dialog.configure(fg_color=self.ogx_colors["bg"])
+        dialog.grab_set()
+
+        frame = ctk.CTkFrame(dialog)
+        frame.pack(fill="both", expand=True, padx=12, pady=12)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(1, weight=1)
+
+        dry_var = ctk.BooleanVar(value=True)
+        top_row = ctk.CTkFrame(frame, fg_color="transparent")
+        top_row.grid(row=0, column=0, sticky="ew", padx=8, pady=(4, 8))
+        sys_dry_cb = ctk.CTkCheckBox(top_row, text="Dry-Run (Simulation ohne echte Änderungen)", variable=dry_var)
+        sys_dry_cb.pack(side="right")
+
+        tabview = ctk.CTkTabview(frame)
+        tabview.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        tabview.add("Computer")
+        tabview.add("Updates")
+        tabview.add("Protokoll")
+        self._device_settings_tabview = tabview
+
+        computer_tab = tabview.tab("Computer")
+        updates_tab = tabview.tab("Updates")
+        log_tab = tabview.tab("Protokoll")
+        computer_tab.grid_columnconfigure(1, weight=1)
+        updates_tab.grid_columnconfigure(1, weight=1)
+        log_tab.grid_columnconfigure(0, weight=1)
+        log_tab.grid_rowconfigure(1, weight=1)
+
+        current_pc_var = ctk.StringVar(value=self.system_tools.get_computer_name())
+        ctk.CTkLabel(computer_tab, text="Aktueller Computername").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 6))
+        ctk.CTkLabel(computer_tab, textvariable=current_pc_var, anchor="w").grid(row=0, column=1, sticky="w", padx=8, pady=(8, 6))
+        pc_new_name_var = ctk.StringVar(value="")
+        ctk.CTkLabel(computer_tab, text="Neuer Computername").grid(row=1, column=0, sticky="w", padx=8, pady=(8, 6))
+        ctk.CTkEntry(computer_tab, textvariable=pc_new_name_var).grid(row=1, column=1, sticky="ew", padx=8, pady=(8, 6))
+        ctk.CTkLabel(
+            computer_tab,
+            text="Max. 15 Zeichen, Buchstaben/Ziffern/Bindestrich (NetBIOS). Administratorrechte nötig. Dry-Run nutzt -WhatIf.",
+            anchor="w",
+            justify="left",
+            text_color=("gray35", "gray70"),
+            wraplength=720,
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
+        restart_after_rename_var = ctk.BooleanVar(value=False)
+        restart_rename_cb = ctk.CTkCheckBox(
+            computer_tab,
+            text="Nach Umbenennung sofort neu starten (-Restart)",
+            variable=restart_after_rename_var,
+        )
+        restart_rename_cb.grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 4))
+
+        pc_status = ctk.CTkLabel(computer_tab, text="bereit", width=70, corner_radius=8, fg_color="#2c5a4a", text_color="#e6f7ef")
+        pc_status.grid(row=0, column=2, rowspan=2, padx=8, pady=(8, 6), sticky="ne")
+
+        ctk.CTkLabel(
+            updates_tab,
+            text="Windows-Updates können hier erst gescannt und danach installiert werden. Installation kann Neustart erfordern.",
+            anchor="w",
+            justify="left",
+            text_color=("gray35", "gray70"),
+            wraplength=720,
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 8))
+        updates_status = ctk.CTkLabel(updates_tab, text="bereit", width=70, corner_radius=8, fg_color="#2c5a4a", text_color="#e6f7ef")
+        updates_status.grid(row=0, column=2, padx=8, pady=(8, 6), sticky="e")
+
+        self._device_settings_status_labels = {
+            "Computer": pc_status,
+            "Updates": updates_status,
+        }
+
+        ctk.CTkLabel(log_tab, text="Protokoll / Details", font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=8, pady=(8, 4)
+        )
+        output = ctk.CTkTextbox(log_tab, wrap="word")
+        output.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        self._device_settings_output_box = output
+
+        def _append(lines: list[str]) -> None:
+            if not lines:
+                return
+            output.insert("end", "\n".join(lines) + "\n")
+            output.see("end")
+
+        def _run_in_thread(fn, tab_name: str) -> None:
+            self._set_device_tab_status(tab_name, "läuft")
+            if self._device_settings_tabview is not None:
+                self._device_settings_tabview.set("Protokoll")
+
+            def worker() -> None:
+                try:
+                    result = fn()
+                    self.ui_queue.put(("device_settings_output", {"lines": result.lines, "tab": tab_name, "ok": bool(result.ok)}))
+                except Exception as exc:  # pylint: disable=broad-except
+                    self.ui_queue.put(("device_settings_output", {"lines": [f"Fehler: {exc}"], "tab": tab_name, "ok": False}))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def rename_pc() -> None:
+            newn = pc_new_name_var.get().strip()
+            if not newn:
+                messagebox.showwarning(APP_NAME, "Bitte neuen Computernamen eintragen.")
+                return
+            restart = bool(restart_after_rename_var.get())
+            dry = bool(dry_var.get())
+            if not dry and restart:
+                if not messagebox.askyesno(
+                    APP_NAME,
+                    "Der PC wird nach erfolgreicher Umbenennung neu gestartet. Nicht gespeicherte Arbeit speichern. Fortfahren?",
+                ):
+                    return
+            _append(["Starte Computer-Umbenennung..."])
+            _run_in_thread(lambda: self.system_tools.rename_computer(newn, dry, restart), "Computer")
+
+        def scan_updates() -> None:
+            _append(["Suche Windows Updates..."])
+            _run_in_thread(self.system_tools.scan_windows_updates, "Updates")
+
+        def install_updates() -> None:
+            _append(["Starte Windows Update Installation..."])
+            _run_in_thread(lambda: self.system_tools.install_windows_updates(dry_var.get()), "Updates")
+
+        rename_pc_btn = ctk.CTkButton(computer_tab, text="PC umbenennen", command=rename_pc)
+        rename_pc_btn.grid(row=4, column=0, columnspan=2, padx=8, pady=(0, 8), sticky="ew")
+        self._attach_tooltip(rename_pc_btn, "Benennt den Windows-Computer um (Rename-Computer). Erfordert typischerweise Administratorrechte.")
+
+        # --- Dateiendungen anzeigen ---
+        sep = ctk.CTkFrame(computer_tab, height=1, fg_color=self.ogx_colors["border"])
+        sep.grid(row=5, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 8))
+
+        ctk.CTkLabel(computer_tab, text="Dateiendungen anzeigen", anchor="w", font=ctk.CTkFont(size=11, weight="bold")).grid(
+            row=6, column=0, sticky="w", padx=8, pady=(4, 2)
+        )
+        ctk.CTkLabel(
+            computer_tab,
+            text="Zeigt Dateiendungen im Explorer an (z. B. .pdf, .exe). Ändert HKCU\\...\\Explorer\\Advanced\\HideFileExt.",
+            anchor="w",
+            justify="left",
+            text_color=("gray35", "gray70"),
+            wraplength=600,
+        ).grid(row=7, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 6))
+
+        file_ext_status_lbl = ctk.CTkLabel(computer_tab, text="...", width=100, corner_radius=6)
+        file_ext_status_lbl.grid(row=6, column=1, sticky="w", padx=8)
+
+        def _refresh_file_ext_status() -> None:
+            r = read_show_file_extensions()
+            if not r.available:
+                file_ext_status_lbl.configure(text="N/V", fg_color="#5b3742", text_color="#f7e9ed")
+            elif r.on:
+                file_ext_status_lbl.configure(text="Sichtbar", fg_color="#2f7d4f", text_color="#e8fff0")
+            else:
+                file_ext_status_lbl.configure(text="Versteckt", fg_color="#495261", text_color="#f0f4f8")
+
+        def _toggle_file_extensions() -> None:
+            cur = read_show_file_extensions()
+            ok, msg = apply_show_file_extensions(not cur.on)
+            if not ok:
+                messagebox.showerror(APP_NAME, f"Fehler: {msg}", parent=dialog)
+            _refresh_file_ext_status()
+
+        file_ext_btn = ctk.CTkButton(computer_tab, text="Umschalten", width=120, command=_toggle_file_extensions)
+        file_ext_btn.grid(row=6, column=2, padx=8, pady=(4, 2), sticky="e")
+        self._attach_tooltip(file_ext_btn, "Wechselt zwischen 'Endungen anzeigen' und 'Endungen verstecken' für den aktuellen Benutzer.")
+        _refresh_file_ext_status()
+
+        scan_updates_btn = ctk.CTkButton(updates_tab, text="Windows-Updates scannen", command=scan_updates)
+        scan_updates_btn.grid(row=1, column=0, padx=8, pady=(0, 8), sticky="ew")
+        self._attach_tooltip(scan_updates_btn, "Listet verfügbare Windows-Software-Updates.")
+        install_updates_btn = ctk.CTkButton(updates_tab, text="Windows-Updates installieren", command=install_updates)
+        install_updates_btn.grid(row=1, column=1, padx=8, pady=(0, 8), sticky="ew")
+        self._attach_tooltip(install_updates_btn, "Installiert gefundene Windows-Updates; kann Neustart erfordern.")
+
+        self._apply_ogx_style(dialog)
+
     def _open_system_settings_dialog(self) -> None:
         if self._system_settings_win is not None and self._system_settings_win.winfo_exists():
             self._system_settings_win.lift()
@@ -1538,6 +1978,26 @@ class UpdaterApp(ctk.CTk):
         refresh_btn = ctk.CTkButton(top_bar, text="Aktualisieren", width=120, command=self._refresh_energy_dashboard_async)
         refresh_btn.pack(side="right")
         self._energy_action_buttons["refresh"] = refresh_btn
+        restore_btn = ctk.CTkButton(
+            top_bar,
+            text="Energieeinstellungen zurücksetzen",
+            width=240,
+            fg_color=self.ogx_colors["danger"],
+            hover_color=self.ogx_colors["danger_hover"],
+            command=lambda: self._energy_action_clicked("restore_defaults"),
+        )
+        restore_btn.pack(side="right", padx=(0, 8))
+        self._energy_action_buttons["restore_defaults"] = restore_btn
+        apply_btn = ctk.CTkButton(
+            top_bar,
+            text="Empfohlenes Energie-Setup anwenden",
+            width=280,
+            fg_color="#2f7d4f",
+            hover_color="#25643f",
+            command=lambda: self._energy_action_clicked("apply_recommended"),
+        )
+        apply_btn.pack(side="right", padx=(0, 8))
+        self._energy_action_buttons["apply_recommended"] = apply_btn
 
         for title in ("Energiestatus", "Eingesteckt", "Akku", "Anzeige & Komfort", "Akku schonen"):
             sec = ctk.CTkFrame(outer)
@@ -1545,19 +2005,19 @@ class UpdaterApp(ctk.CTk):
             ctk.CTkLabel(sec, text=title, font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=10, pady=(8, 4))
             setattr(self, f"_sec_{title.lower().replace(' ', '_').replace('&', 'und')}", sec)
 
-        self._add_energy_row(getattr(self, "_sec_energiestatus"), "status_ac_mode", "Eingesteckt", "")
+        self._add_energy_row(getattr(self, "_sec_energiestatus"), "status_ac_mode", "Eingesteckt", "", action_key="apply_power_profile")
         self._add_energy_row(getattr(self, "_sec_energiestatus"), "status_dc_mode", "Akku", "")
         self._add_energy_row(getattr(self, "_sec_energiestatus"), "status_battery_percent_setting", "Akkuprozentsatz anzeigen", "", action_key="toggle_battery_percent")
 
-        self._add_energy_row(getattr(self, "_sec_eingesteckt"), "ac_power_button", "Netzschalter-Aktion", "")
-        self._add_energy_row(getattr(self, "_sec_eingesteckt"), "ac_lid_action", "Deckel schließen", "")
-        self._add_energy_row(getattr(self, "_sec_eingesteckt"), "ac_display_timeout", "Bildschirm ausschalten nach", "")
-        self._add_energy_row(getattr(self, "_sec_eingesteckt"), "ac_sleep_timeout", "Standby nach", "")
+        self._add_energy_row(getattr(self, "_sec_eingesteckt"), "ac_power_button", "Netzschalter-Aktion", "", action_key="set_ac_power_sleep")
+        self._add_energy_row(getattr(self, "_sec_eingesteckt"), "ac_lid_action", "Deckel schließen", "", action_key="set_ac_lid_none")
+        self._add_energy_row(getattr(self, "_sec_eingesteckt"), "ac_display_timeout", "Bildschirm ausschalten nach", "", action_key="apply_ac_display")
+        self._add_energy_row(getattr(self, "_sec_eingesteckt"), "ac_sleep_timeout", "Standby nach", "", action_key="apply_ac_sleep")
 
-        self._add_energy_row(getattr(self, "_sec_akku"), "dc_power_button", "Netzschalter-Aktion", "")
-        self._add_energy_row(getattr(self, "_sec_akku"), "dc_lid_action", "Deckel schließen", "")
-        self._add_energy_row(getattr(self, "_sec_akku"), "dc_display_timeout", "Bildschirm ausschalten nach", "")
-        self._add_energy_row(getattr(self, "_sec_akku"), "dc_sleep_timeout", "Standby nach", "")
+        self._add_energy_row(getattr(self, "_sec_akku"), "dc_power_button", "Netzschalter-Aktion", "", action_key="set_dc_power_sleep")
+        self._add_energy_row(getattr(self, "_sec_akku"), "dc_lid_action", "Deckel schließen", "", action_key="set_dc_lid_none")
+        self._add_energy_row(getattr(self, "_sec_akku"), "dc_display_timeout", "Bildschirm ausschalten nach", "", action_key="apply_dc_display")
+        self._add_energy_row(getattr(self, "_sec_akku"), "dc_sleep_timeout", "Standby nach", "", action_key="apply_dc_sleep")
 
         self._add_energy_row(getattr(self, "_sec_anzeige_und_komfort"), "dark_mode", "Darkmode", "", action_key="toggle_dark_mode")
         self._add_energy_row(getattr(self, "_sec_anzeige_und_komfort"), "screensaver_disabled", "Bildschirmschoner deaktivieren", "", action_key="toggle_screensaver")
@@ -1572,6 +2032,7 @@ class UpdaterApp(ctk.CTk):
             "usb_power_saving",
             "USB-Geräte beim ausgeschalteten Bildschirm beenden",
             "USB-Geräte beenden, wenn der Bildschirm ausgeschaltet ist, um Akkuverbrauch zu verringern",
+            action_key="apply_usb_power",
         )
 
         self._add_energy_row(getattr(self, "_sec_akku_schonen"), "battery_percent", "Aktueller Akkustand", "")
@@ -1604,9 +2065,37 @@ class UpdaterApp(ctk.CTk):
         self._energy_value_labels[key] = value
         self._energy_status_pills[key] = pill
         if action_key:
-            btn = ctk.CTkButton(row, text="Umschalten", width=95, height=22, command=lambda k=action_key: self._energy_action_clicked(k))
+            btn = ctk.CTkButton(
+                row,
+                text=self._energy_action_button_text(action_key),
+                width=120,
+                height=22,
+                command=lambda k=action_key: self._energy_action_clicked(k),
+            )
             btn.grid(row=0, column=3, sticky="e")
             self._energy_action_buttons[action_key] = btn
+
+    @staticmethod
+    def _energy_action_button_text(action_key: str) -> str:
+        text_map = {
+            "toggle_dark_mode": "Umschalten",
+            "toggle_screensaver": "Umschalten",
+            "toggle_battery_percent": "Umschalten",
+            "apply_ac_display": "Anwenden",
+            "apply_dc_display": "Anwenden",
+            "apply_ac_sleep": "Anwenden",
+            "apply_dc_sleep": "Anwenden",
+            "set_ac_lid_none": "Auf Keine Aktion",
+            "set_dc_lid_none": "Auf Keine Aktion",
+            "set_ac_power_sleep": "Auf Standbymodus",
+            "set_dc_power_sleep": "Auf Standbymodus",
+            "apply_power_profile": "Gewünschtes Profil",
+            "apply_usb_power": "Anwenden",
+            "apply_recommended": "Empfohlen anwenden",
+            "restore_defaults": "Zurücksetzen",
+            "refresh": "Aktualisieren",
+        }
+        return text_map.get(action_key, "Anwenden")
 
     def _refresh_energy_dashboard_async(self) -> None:
         def worker() -> None:
@@ -1663,20 +2152,110 @@ class UpdaterApp(ctk.CTk):
         label = f"{cap.vendor}: erkannt"
         return SettingState(label, available=True, hint=cap.guidance)
 
+    def _desired_system_settings(self) -> dict:
+        cfg = get_config_dict(self.logger)
+        raw = cfg.get("system_settings", {})
+        merged = dict(DEFAULT_SYSTEM_SETTINGS)
+        if isinstance(raw, dict):
+            merged.update(raw)
+        return merged
+
+    @staticmethod
+    def _to_bool(value: object, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        text = str(value or "").strip().lower()
+        if text in ("1", "true", "yes", "ja", "an", "on", "enabled"):
+            return True
+        if text in ("0", "false", "no", "nein", "aus", "off", "disabled"):
+            return False
+        return default
+
     def _energy_action_clicked(self, action_key: str) -> None:
         def worker() -> None:
+            desired = self._desired_system_settings()
+            changes: list[str] = []
+            ok = True
+            msg = "OK"
+
+            def _apply_single(name: str, fn) -> None:
+                nonlocal ok, msg
+                try:
+                    a_ok, a_msg = fn()
+                except Exception as exc:  # pylint: disable=broad-except
+                    a_ok, a_msg = False, str(exc)
+                if a_ok:
+                    changes.append(f"{name}: angewendet")
+                else:
+                    changes.append(f"{name}: Nicht verfügbar/Fehler ({a_msg})")
+                    ok = False
+                    msg = a_msg
+
             if action_key == "toggle_dark_mode":
                 cur = read_dark_mode()
-                ok, msg = apply_dark_mode(not cur.on, self.logger)
+                _apply_single("Darkmode", lambda: apply_dark_mode(not cur.on, self.logger))
             elif action_key == "toggle_screensaver":
                 cur = read_screensaver_state()
-                ok, msg = apply_screensaver_state(not cur.on)
+                _apply_single("Bildschirmschoner", lambda: apply_screensaver_state(not cur.on))
             elif action_key == "toggle_battery_percent":
                 cur = read_show_battery_percent_state()
-                ok, msg = apply_show_battery_percent_state(not cur.on)
+                _apply_single("Akkuprozentsatz", lambda: apply_show_battery_percent_state(not cur.on))
+            elif action_key == "apply_ac_display":
+                sec = int(desired.get("display_timeout_seconds", 30) or 30)
+                _apply_single("Display AC", lambda: apply_display_timeout(True, sec))
+            elif action_key == "apply_dc_display":
+                sec = int(desired.get("display_timeout_seconds", 30) or 30)
+                _apply_single("Display DC", lambda: apply_display_timeout(False, sec))
+            elif action_key == "apply_ac_sleep":
+                mins = 0 if self._to_bool(desired.get("ac_standby_disabled", False)) else int(desired.get("sleep_timeout_minutes", 3) or 3)
+                _apply_single("Standby AC", lambda: apply_sleep_timeout(True, mins))
+            elif action_key == "apply_dc_sleep":
+                mins = 0 if self._to_bool(desired.get("dc_standby_disabled", False)) else int(desired.get("sleep_timeout_minutes", 3) or 3)
+                _apply_single("Standby DC", lambda: apply_sleep_timeout(False, mins))
+            elif action_key == "set_ac_lid_none":
+                _apply_single("Deckel AC", lambda: apply_lid_close_action(True, "none"))
+            elif action_key == "set_dc_lid_none":
+                _apply_single("Deckel DC", lambda: apply_lid_close_action(False, "none"))
+            elif action_key == "set_ac_power_sleep":
+                _apply_single("Netzschalter AC", lambda: apply_power_button_action(True, "sleep"))
+            elif action_key == "set_dc_power_sleep":
+                _apply_single("Netzschalter DC", lambda: apply_power_button_action(False, "sleep"))
+            elif action_key == "apply_power_profile":
+                _apply_single("Energieprofil", lambda: apply_power_profile_toggle(desired, True, self.logger))
+            elif action_key == "apply_usb_power":
+                _apply_single("USB-Energiesparen", lambda: apply_usb_power_saving_state(self._to_bool(desired.get("usb_power_saving_enabled", True), True)))
+            elif action_key == "restore_defaults":
+                from .system_settings import _run as _ss_run
+                res = _ss_run(["powercfg", "/restoredefaultschemes"], timeout=60)
+                if res.returncode == 0:
+                    changes.append("Energieschemas: Windows-Standard wiederhergestellt")
+                else:
+                    tail = ((res.stderr or "") + (res.stdout or "")).strip()[:300]
+                    changes.append(f"Energieschemas: Fehler ({tail or f'Code {res.returncode}'})")
+                    ok = False
+                    msg = tail or "powercfg /restoredefaultschemes failed"
+            elif action_key == "apply_recommended":
+                sec = int(desired.get("display_timeout_seconds", 30) or 30)
+                mins = int(desired.get("sleep_timeout_minutes", 3) or 3)
+                _apply_single("Energieprofil", lambda: apply_power_profile_toggle(desired, True, self.logger))
+                _apply_single("Darkmode", lambda: apply_dark_mode(self._to_bool(desired.get("dark_mode_enabled", False)), self.logger))
+                _apply_single("Bildschirmschoner", lambda: apply_screensaver_state(not self._to_bool(desired.get("screensaver_disabled", False))))
+                _apply_single("Akkuprozentsatz", lambda: apply_show_battery_percent_state(self._to_bool(desired.get("show_battery_percent", False))))
+                _apply_single("Display AC", lambda: apply_display_timeout(True, sec))
+                _apply_single("Display DC", lambda: apply_display_timeout(False, sec))
+                _apply_single("Standby AC", lambda: apply_sleep_timeout(True, 0 if self._to_bool(desired.get("ac_standby_disabled", False)) else mins))
+                _apply_single("Standby DC", lambda: apply_sleep_timeout(False, 0 if self._to_bool(desired.get("dc_standby_disabled", False)) else mins))
+                _apply_single("Deckel AC", lambda: apply_lid_close_action(True, str(desired.get("ac_lid_action", "none"))))
+                _apply_single("Deckel DC", lambda: apply_lid_close_action(False, str(desired.get("dc_lid_action", "sleep"))))
+                _apply_single("Netzschalter AC", lambda: apply_power_button_action(True, str(desired.get("ac_power_button_action", "sleep"))))
+                _apply_single("Netzschalter DC", lambda: apply_power_button_action(False, str(desired.get("dc_power_button_action", "sleep"))))
+                _apply_single("Adaptive Helligkeit", lambda: apply_adaptive_brightness_state(self._to_bool(desired.get("adaptive_brightness_enabled", False))))
+                _apply_single("USB-Energiesparen", lambda: apply_usb_power_saving_state(self._to_bool(desired.get("usb_power_saving_enabled", True), True)))
             else:
                 ok, msg = False, "Unbekannte Aktion"
-            if not ok:
+            for line in changes:
+                self.logger.info("Energie-Aktion: %s", line)
+            if not ok and not changes:
                 self.logger.warning("Energie-Aktion %s fehlgeschlagen: %s", action_key, msg)
             self.ui_queue.put(("energy_dashboard_action_done", {"ok": ok, "msg": msg, "action": action_key}))
 
@@ -1695,11 +2274,11 @@ class UpdaterApp(ctk.CTk):
                 lb.configure(text=value)
             if pill is not None:
                 if pill_kind == "on":
-                    pill.configure(text="AKTIV", fg_color="#2f7d4f", text_color="#e8fff0")
+                    pill.configure(text="AKTIV",   fg_color="#14532D", text_color="#BBF7D0")
                 elif pill_kind == "off":
-                    pill.configure(text="INAKTIV", fg_color="#495261", text_color="#f0f4f8")
+                    pill.configure(text="INAKTIV", fg_color="#334155", text_color="#E2E8F0")
                 elif pill_kind == "na":
-                    pill.configure(text="N/V", fg_color="#5b3742", text_color="#f7e9ed")
+                    pill.configure(text="N/V",     fg_color="#78350F", text_color="#FDE68A")
                 else:
                     pill.configure(text="INFO", fg_color="#424d5d", text_color="#e7eef6")
         guidance = str(data.get("battery_guidance", "")).strip()
@@ -1711,9 +2290,9 @@ class UpdaterApp(ctk.CTk):
         action = str(payload.get("action", ""))
         btn = self._energy_action_buttons.get(action)
         if btn is not None:
-            btn.configure(state="normal", text="Umschalten")
+            btn.configure(state="normal", text=self._energy_action_button_text(action))
         if not bool(payload.get("ok")):
-            self._queue_status("Hinweis: Änderung konnte nicht vollständig angewendet werden.")
+            self._queue_status("Fehler: siehe Log")
         self._refresh_energy_dashboard_async()
 
     def _show_about_dialog(self) -> None:
@@ -1816,17 +2395,13 @@ class UpdaterApp(ctk.CTk):
         tabview = ctk.CTkTabview(frame)
         tabview.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
         tabview.add("Account")
-        tabview.add("Computer")
-        tabview.add("Updates")
         tabview.add("Migration")
         tabview.add("Protokoll")
         self.system_tools_tabview = tabview
         account_tab = tabview.tab("Account")
-        computer_tab = tabview.tab("Computer")
-        updates_tab = tabview.tab("Updates")
         migration_tab = tabview.tab("Migration")
         log_tab = tabview.tab("Protokoll")
-        for tab in (account_tab, computer_tab, updates_tab, migration_tab):
+        for tab in (account_tab, migration_tab):
             tab.grid_columnconfigure(1, weight=1)
         log_tab.grid_columnconfigure(0, weight=1)
         log_tab.grid_rowconfigure(1, weight=1)
@@ -1842,32 +2417,6 @@ class UpdaterApp(ctk.CTk):
             text_color=("gray35", "gray70"),
             wraplength=760,
         ).grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
-
-        current_pc_var = ctk.StringVar(value=self.system_tools.get_computer_name())
-        ctk.CTkLabel(computer_tab, text="Aktueller Computername").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 6))
-        ctk.CTkLabel(computer_tab, textvariable=current_pc_var, anchor="w").grid(row=0, column=1, sticky="w", padx=8, pady=(8, 6))
-        pc_new_name_var = ctk.StringVar(value="")
-        ctk.CTkLabel(computer_tab, text="Neuer Computername").grid(row=1, column=0, sticky="w", padx=8, pady=(8, 6))
-        ctk.CTkEntry(computer_tab, textvariable=pc_new_name_var).grid(row=1, column=1, sticky="ew", padx=8, pady=(8, 6))
-        ctk.CTkLabel(
-            computer_tab,
-            text="Max. 15 Zeichen, Buchstaben/Ziffern/Bindestrich (NetBIOS). Administratorrechte nötig. Dry-Run nutzt -WhatIf.",
-            anchor="w",
-            justify="left",
-            text_color=("gray35", "gray70"),
-            wraplength=760,
-        ).grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
-        restart_after_rename_var = ctk.BooleanVar(value=False)
-        restart_rename_cb = ctk.CTkCheckBox(
-            computer_tab,
-            text="Nach Umbenennung sofort neu starten (-Restart)",
-            variable=restart_after_rename_var,
-        )
-        restart_rename_cb.grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 4))
-        self._attach_tooltip(
-            restart_rename_cb,
-            "Führt Rename-Computer mit -Restart aus. Ohne Häkchen bleibt ein manueller Neustart meist nötig.",
-        )
 
         profile_target_var = ctk.StringVar(value="")
         ctk.CTkLabel(migration_tab, text="Ziel-Profilname").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 6))
@@ -1886,27 +2435,12 @@ class UpdaterApp(ctk.CTk):
         sys_dry_cb.grid(row=0, column=4, sticky="e", padx=(10, 0))
         self._attach_tooltip(sys_dry_cb, "Simuliert Systemaktionen ohne echte Änderungen auf dem Betriebssystem.")
 
-        ctk.CTkLabel(
-            updates_tab,
-            text="Windows-Updates können hier erst gescannt und danach installiert werden. Installation kann Neustart erfordern.",
-            anchor="w",
-            justify="left",
-            text_color=("gray35", "gray70"),
-            wraplength=760,
-        ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 8))
-
         account_status = ctk.CTkLabel(account_tab, text="bereit", width=70, corner_radius=8, fg_color="#2c5a4a", text_color="#e6f7ef")
         account_status.grid(row=0, column=2, padx=8, pady=(8, 6), sticky="e")
-        updates_status = ctk.CTkLabel(updates_tab, text="bereit", width=70, corner_radius=8, fg_color="#2c5a4a", text_color="#e6f7ef")
-        updates_status.grid(row=0, column=2, padx=8, pady=(8, 6), sticky="e")
         migration_status = ctk.CTkLabel(migration_tab, text="bereit", width=70, corner_radius=8, fg_color="#2c5a4a", text_color="#e6f7ef")
         migration_status.grid(row=0, column=2, padx=8, pady=(8, 6), sticky="e")
-        pc_status = ctk.CTkLabel(computer_tab, text="bereit", width=70, corner_radius=8, fg_color="#2c5a4a", text_color="#e6f7ef")
-        pc_status.grid(row=0, column=2, rowspan=2, padx=8, pady=(8, 6), sticky="ne")
         self.system_tools_status_labels = {
             "Account": account_status,
-            "Computer": pc_status,
-            "Updates": updates_status,
             "Migration": migration_status,
         }
 
@@ -1948,14 +2482,6 @@ class UpdaterApp(ctk.CTk):
             _append(["Starte Safe-Account-Aktion..."])
             _run_in_thread(lambda: self.system_tools.run_account_safe_update(source_user, target, dry_var.get()), "Account")
 
-        def scan_updates() -> None:
-            _append(["Suche Windows Updates..."])
-            _run_in_thread(self.system_tools.scan_windows_updates, "Updates")
-
-        def install_updates() -> None:
-            _append(["Starte Windows Update Installation..."])
-            _run_in_thread(lambda: self.system_tools.install_windows_updates(dry_var.get()), "Updates")
-
         def migration_precheck() -> None:
             source_user = source_user_var.get().strip()
             if not source_user or source_user.startswith("("):
@@ -1980,36 +2506,9 @@ class UpdaterApp(ctk.CTk):
             _append(["Starte Profil-Migrations-Vorbereitung..."])
             _run_in_thread(lambda: self.system_tools.execute_profile_migration(source_user, target, dry_var.get()), "Migration")
 
-        def rename_pc() -> None:
-            newn = pc_new_name_var.get().strip()
-            if not newn:
-                messagebox.showwarning(APP_NAME, "Bitte neuen Computernamen eintragen.")
-                return
-            restart = bool(restart_after_rename_var.get())
-            dry = bool(dry_var.get())
-            if not dry and restart:
-                if not messagebox.askyesno(
-                    APP_NAME,
-                    "Der PC wird nach erfolgreicher Umbenennung neu gestartet. Nicht gespeicherte Arbeit speichern. Fortfahren?",
-                ):
-                    return
-            _append(["Starte Computer-Umbenennung..."])
-            _run_in_thread(lambda: self.system_tools.rename_computer(newn, dry, restart), "Computer")
-
         safe_account_btn = ctk.CTkButton(account_tab, text="Account + Struktur (Safe)", command=run_safe_account)
         safe_account_btn.grid(row=2, column=0, columnspan=2, padx=8, pady=(0, 8), sticky="ew")
         self._attach_tooltip(safe_account_btn, "Ändert Kontovollname und prüft/erstellt die Basis-Ordnerstruktur des gewählten Benutzers.")
-
-        rename_pc_btn = ctk.CTkButton(computer_tab, text="PC umbenennen", command=rename_pc)
-        rename_pc_btn.grid(row=4, column=0, columnspan=2, padx=8, pady=(0, 8), sticky="ew")
-        self._attach_tooltip(rename_pc_btn, "Benennt den Windows-Computer um (Rename-Computer). Erfordert typischerweise Administratorrechte.")
-
-        scan_updates_btn = ctk.CTkButton(updates_tab, text="Windows-Updates scannen", command=scan_updates)
-        scan_updates_btn.grid(row=1, column=0, padx=8, pady=(0, 8), sticky="ew")
-        self._attach_tooltip(scan_updates_btn, "Listet verfügbare Windows-Software-Updates.")
-        install_updates_btn = ctk.CTkButton(updates_tab, text="Windows-Updates installieren", command=install_updates)
-        install_updates_btn.grid(row=1, column=1, padx=8, pady=(0, 8), sticky="ew")
-        self._attach_tooltip(install_updates_btn, "Installiert gefundene Windows-Updates; kann Neustart erfordern.")
 
         migration_precheck_btn = ctk.CTkButton(migration_tab, text="Migrations-Precheck", command=migration_precheck)
         migration_precheck_btn.grid(row=2, column=0, padx=8, pady=(0, 8), sticky="ew")
@@ -2215,6 +2714,7 @@ class UpdaterApp(ctk.CTk):
                 provider_configs=self.runtime.software_providers,
                 local_source_service=self.local_source,
                 prefer_local_source=self.runtime.local_source_prefer_local,
+                local_source_strict=self.runtime.local_source_strict,
                 scanner=self.scanner,
                 installer_settle_wait_seconds=self.runtime.installer_settle_wait_seconds,
                 installer_verify_after_timeout=self.runtime.installer_verify_after_timeout,
@@ -2253,7 +2753,7 @@ class UpdaterApp(ctk.CTk):
                     child.configure(
                         fg_color=self.ogx_colors["accent"],
                         hover_color=self.ogx_colors["accent_hover"],
-                        text_color="#f4f7fd",
+                        text_color=self.ogx_colors["text"],
                         border_width=0,
                         corner_radius=6,
                         height=20,
@@ -2283,7 +2783,7 @@ class UpdaterApp(ctk.CTk):
                         fg_color=self.ogx_colors["accent"],
                         hover_color=self.ogx_colors["accent_hover"],
                         border_color=self.ogx_colors["border"],
-                        checkmark_color="#03131a",
+                        checkmark_color=self.ogx_colors["text"],
                         text_color=self.ogx_colors["text"],
                     )
                 elif isinstance(child, ctk.CTkSegmentedButton):
@@ -2292,7 +2792,7 @@ class UpdaterApp(ctk.CTk):
                         selected_color=self.ogx_colors["accent"],
                         selected_hover_color=self.ogx_colors["accent_hover"],
                         unselected_color=self.ogx_colors["panel"],
-                        unselected_hover_color="#1a2632",
+                        unselected_hover_color=self.ogx_colors["table"],
                         text_color=self.ogx_colors["text"],
                         height=20,
                         font=ctk.CTkFont(size=10),
@@ -2304,7 +2804,7 @@ class UpdaterApp(ctk.CTk):
                         segmented_button_selected_color=self.ogx_colors["accent"],
                         segmented_button_selected_hover_color=self.ogx_colors["accent_hover"],
                         segmented_button_unselected_color=self.ogx_colors["panel"],
-                        segmented_button_unselected_hover_color="#1a2632",
+                        segmented_button_unselected_hover_color=self.ogx_colors["table"],
                         text_color=self.ogx_colors["text"],
                     )
                 elif isinstance(child, ctk.CTkLabel):
@@ -2339,25 +2839,25 @@ class UpdaterApp(ctk.CTk):
         buchhaltung = messagebox.askyesno(
             APP_NAME,
             "Alle Programme sind ausgewählt — inklusive FileZilla.\n\n"
-            "Soll FileZilla für die Buchhaltung mit installiert werden?\n\n"
-            "Ja = Buchhaltung (FileZilla bleibt angehakt)\n"
-            "Nein = keine Buchhaltung (FileZilla wird abgewählt, kein Download/Install dafür)",
+            "Soll FileZilla für die Provision-Abrechnung mit installiert werden?\n\n"
+            "Ja = Provision-Abrechnung (FileZilla bleibt angehakt)\n"
+            "Nein = keine Provision-Abrechnung (FileZilla wird abgewählt, kein Download/Install dafür)",
             parent=self,
         )
         if buchhaltung:
             self._filezilla_buchhaltung = True
-            self.logger.info("Alle Pakete: FileZilla fuer Buchhaltung mit ausgewaehlt.")
+            self.logger.info("Alle Pakete: FileZilla fuer Provision-Abrechnung mit ausgewaehlt.")
             self.hint_line.configure(
-                text="FileZilla: Buchhaltung — bleibt in der Auswahl; Hinweis bei Installation im Log."
+                text="FileZilla: Provision-Abrechnung — bleibt in der Auswahl; Hinweis bei Installation im Log."
             )
         else:
             self._filezilla_buchhaltung = None
             fz_var = self.checkbox_vars.get("filezilla")
             if fz_var is not None:
                 fz_var.set(False)
-            self.logger.info("Alle Pakete: FileZilla abgewaehlt (keine Buchhaltung).")
+            self.logger.info("Alle Pakete: FileZilla abgewaehlt (keine Provision-Abrechnung).")
             self.hint_line.configure(
-                text="FileZilla: abgewaehlt (nur bei Buchhaltung mit Alle Pakete auswaehlen)."
+                text="FileZilla: abgewaehlt (nur bei Provision-Abrechnung mit Alle Pakete auswaehlen)."
             )
 
     def _select_missing_only(self) -> None:
@@ -2423,7 +2923,7 @@ class UpdaterApp(ctk.CTk):
                 self.last_report_file = self.report_writer.write_report(rows, "scan_report")
                 html_report_path = ""
                 try:
-                    html_report_path = str(write_html_report(rows, "scan_report", "GBB SoftwareUpdater – Prüfung"))
+                    html_report_path = str(write_html_report(rows, "scan_report", "Compexx-InstallTool – Prüfung"))
                     self.logger.info("HTML-Report: %s", html_report_path)
                 except Exception as exc:  # pylint: disable=broad-except
                     self.logger.warning("HTML-Report: %s", exc)
@@ -2766,15 +3266,6 @@ class UpdaterApp(ctk.CTk):
                 return
 
         dry = self.dry_run_var.get()
-        if not dry and InstallerService.is_reboot_pending():
-            choice = self._reboot_pending_blocking_dialog()
-            if choice == "restart":
-                self._operation_lock.release()
-                try:
-                    subprocess.run(["shutdown", "/r", "/t", "0"], check=False)
-                except Exception:  # pylint: disable=broad-except
-                    messagebox.showerror(APP_NAME, "Neustart konnte nicht gestartet werden.", parent=self)
-                return
 
         office_removal_ack_keys: set[str] = set()
         keys_to_process = list(keys)
@@ -2861,9 +3352,9 @@ class UpdaterApp(ctk.CTk):
             try:
                 if mode == "install" and "filezilla" in keys:
                     if self._filezilla_buchhaltung is True:
-                        self.logger.info("FileZilla: Installation im Buchhaltungskontext (per Alle Pakete: Ja).")
+                        self.logger.info("FileZilla: Installation im Kontext Provision-Abrechnung (per Alle Pakete: Ja).")
                     else:
-                        self.logger.info("FileZilla: Installation ohne Buchhaltungs-Markierung (manuell oder anderer Auswahlweg).")
+                        self.logger.info("FileZilla: Installation ohne Provision-Abrechnung-Markierung (manuell oder anderer Auswahlweg).")
                 if mode in ("install", "remove"):
                     self.ui_queue.put(("progress_phase", "Hintergrundprüfung"))
                     self._queue_status("Installationsstatus wird aktualisiert...")
@@ -2933,7 +3424,7 @@ class UpdaterApp(ctk.CTk):
                 self.last_report_file = self.report_writer.write_report(rows, "install_report")
                 html_report_path = ""
                 try:
-                    html_report_path = str(write_html_report(rows, "install_report", "GBB SoftwareUpdater – Bericht"))
+                    html_report_path = str(write_html_report(rows, "install_report", "Compexx-InstallTool – Bericht"))
                     self.logger.info("HTML-Report: %s", html_report_path)
                 except Exception as exc:  # pylint: disable=broad-except
                     self.logger.warning("HTML-Report: %s", exc)
@@ -2944,9 +3435,12 @@ class UpdaterApp(ctk.CTk):
                     for rk in keys:
                         if rk in fresh_remove:
                             self.ui_queue.put(("software_row", (rk, fresh_remove[rk])))
-                pending_after = any((r.reboot_required or "no").lower() == "yes" for r in rows)
+                pending_after = not dry and (
+                    any((r.reboot_required or "no").lower() == "yes" for r in rows)
+                    or InstallerService.is_reboot_pending()
+                )
                 if pending_after:
-                    self.ui_queue.put(("hint", "Neustart empfohlen"))
+                    self.ui_queue.put(("reboot_pending_after_install", None))
                 self.logger.info("Vorgang abgeschlossen.")
                 self._queue_status("OK - Vorgang abgeschlossen.")
                 summary = self._install_summary_message(rows, dry, mandatory=mandatory, operation=mode)
@@ -3011,7 +3505,7 @@ class UpdaterApp(ctk.CTk):
             local_cfg["last_path"] = path
         local_cfg["prefer_local"] = bool(self.prefer_local_var.get())
         cfg["local_source"] = local_cfg
-        save_config_dict(cfg, self.logger)
+        save_config_dict(cfg, self.logger, backup=False)
         self.installer.prefer_local_source = bool(self.prefer_local_var.get())
 
     def _select_local_source(self) -> None:
@@ -3074,8 +3568,11 @@ class UpdaterApp(ctk.CTk):
         state = "normal" if enabled else "disabled"
         for btn in self._toolbar_buttons:
             btn.configure(state=state)
-        if self.filter_segment is not None:
-            self.filter_segment.configure(state=state)
+        for btn in self._filter_count_labels.values():
+            try:
+                btn.configure(state=state)
+            except Exception:
+                pass
         if self.search_entry is not None:
             self.search_entry.configure(state=state)
 
@@ -3312,7 +3809,16 @@ class UpdaterApp(ctk.CTk):
                     self._download_progress_suffix = ""
                     self._apply_status_line()
                     self._refresh_progress_count_label()
+                    self._update_filter_counts()
                 self._set_actions_enabled(bool(payload))
+            elif action == "reboot_pending_after_install":
+                choice = self._reboot_pending_blocking_dialog()
+                if choice == "restart":
+                    import subprocess
+                    try:
+                        subprocess.run(["shutdown", "/r", "/t", "0"], check=False)
+                    except Exception:  # pylint: disable=broad-except
+                        messagebox.showerror(APP_NAME, "Neustart konnte nicht gestartet werden.", parent=self)
             elif action == "hint":
                 self.hint_line.configure(text=str(payload))
             elif action == "refresh_history":
@@ -3359,6 +3865,22 @@ class UpdaterApp(ctk.CTk):
                     self.system_tools_output_box.see("end")
                 if tab_name:
                     self._set_system_tab_status(tab_name, "bereit" if ok else "fehler")
+            elif action == "device_settings_output":
+                lines: list[str]
+                tab_name = ""
+                ok = True
+                if isinstance(payload, dict):
+                    raw_lines = payload.get("lines")
+                    lines = raw_lines if isinstance(raw_lines, list) else [str(raw_lines)]
+                    tab_name = str(payload.get("tab") or "")
+                    ok = bool(payload.get("ok", True))
+                else:
+                    lines = payload if isinstance(payload, list) else [str(payload)]
+                if self._device_settings_output_box is not None:
+                    self._device_settings_output_box.insert("end", "\n".join(str(x) for x in lines) + "\n")
+                    self._device_settings_output_box.see("end")
+                if tab_name:
+                    self._set_device_tab_status(tab_name, "bereit" if ok else "fehler")
 
         if ui_burst >= max_ui_burst:
             self.update_idletasks()

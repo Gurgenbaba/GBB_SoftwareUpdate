@@ -17,9 +17,20 @@ GUID_BALANCED = "381b4222-f694-41f0-9685-ff5bb260df2e"
 GUID_HIGH = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
 
 DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
-    "display_timeout_seconds": 30,
-    "sleep_timeout_minutes": 3,
+    "display_timeout_seconds": 900,
+    "sleep_timeout_minutes": 15,
     "power_profile": "balanced",
+    "dark_mode_enabled": True,
+    "screensaver_disabled": True,
+    "show_battery_percent": True,
+    "ac_lid_action": "none",
+    "dc_lid_action": "none",
+    "ac_power_button_action": "sleep",
+    "dc_power_button_action": "sleep",
+    "ac_standby_disabled": False,
+    "dc_standby_disabled": False,
+    "adaptive_brightness_enabled": True,
+    "usb_power_saving_enabled": True,
 }
 
 DEFAULT_UI_COLUMNS: dict[str, int] = {
@@ -524,6 +535,18 @@ def _read_power_setting_index(subgroup: str, setting: str, *, ac: bool) -> int |
     return None
 
 
+def _set_power_setting_index(subgroup: str, setting: str, *, ac: bool, value: int) -> tuple[bool, str]:
+    scheme = active_power_scheme_guid()
+    if not scheme:
+        return False, "Aktives Energieschema nicht lesbar."
+    cmd = ["powercfg", "/setacvalueindex" if ac else "/setdcvalueindex", scheme, subgroup, setting, str(value)]
+    res = _run(cmd, timeout=60)
+    if res.returncode != 0:
+        return False, ((res.stderr or "") + (res.stdout or "")).strip()[:300] or f"Code {res.returncode}"
+    _run(["powercfg", "/setactive", scheme], timeout=40)
+    return True, "OK"
+
+
 def read_power_mode_ac_dc() -> tuple[SettingState, SettingState]:
     if platform.system() != "Windows":
         na = _state("Nicht verfügbar", False, "Nur unter Windows.")
@@ -588,12 +611,70 @@ def apply_show_battery_percent_state(enable: bool) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def read_show_file_extensions() -> ToggleReadResult:
+    if winreg is None or platform.system() != "Windows":
+        return ToggleReadResult(False, False, "Nur unter Windows verfügbar.")
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "HideFileExt")
+        # HideFileExt=0 means extensions ARE shown (toggle ON), 1 means hidden
+        return ToggleReadResult(True, int(value) == 0, detail=f"HideFileExt={int(value)}")
+    except OSError:
+        return ToggleReadResult(True, True, detail="HideFileExt not set (default: shown)")
+
+
+def apply_show_file_extensions(show: bool) -> tuple[bool, str]:
+    if winreg is None or platform.system() != "Windows":
+        return False, "Nur unter Windows verfügbar."
+    try:
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+            0,
+            winreg.KEY_SET_VALUE,
+        ) as key:
+            winreg.SetValueEx(key, "HideFileExt", 0, winreg.REG_DWORD, 0 if show else 1)
+        # Notify Explorer to refresh without restarting it
+        _run(
+            [
+                "powershell", "-NoProfile", "-Command",
+                "Add-Type @'\nusing System;using System.Runtime.InteropServices;\n"
+                "public class Shell32 { [DllImport(\"Shell32.dll\")] public static extern int "
+                "SHChangeNotify(int e, int f, IntPtr a, IntPtr b); }\n'@; "
+                "[Shell32]::SHChangeNotify(0x8000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)",
+            ],
+            timeout=15,
+        )
+        return True, "OK"
+    except OSError as exc:
+        return False, str(exc)
+
+
 def read_power_button_action(ac: bool) -> SettingState:
     idx = _read_power_setting_index("SUB_BUTTONS", "PBUTTONACTION", ac=ac)
     if idx is None:
         return _state("Nicht verfügbar", False, "PBUTTONACTION nicht lesbar.")
     mapping = {0: "Nichts tun", 1: "Standbymodus", 2: "Ruhezustand", 3: "Herunterfahren"}
     return _state(mapping.get(idx, f"Unbekannt ({idx})"))
+
+
+def apply_power_button_action(ac: bool, action: str) -> tuple[bool, str]:
+    mapping = {
+        "none": 0,
+        "sleep": 1,
+        "hibernate": 2,
+        "shutdown": 3,
+        "nichts tun": 0,
+        "standbymodus": 1,
+        "herunterfahren": 3,
+    }
+    key = (action or "").strip().lower()
+    if key not in mapping:
+        return False, f"Unbekannte Aktion: {action}"
+    return _set_power_setting_index("SUB_BUTTONS", "PBUTTONACTION", ac=ac, value=mapping[key])
 
 
 def read_lid_close_action(ac: bool) -> SettingState:
@@ -604,6 +685,22 @@ def read_lid_close_action(ac: bool) -> SettingState:
     return _state(mapping.get(idx, f"Unbekannt ({idx})"))
 
 
+def apply_lid_close_action(ac: bool, action: str) -> tuple[bool, str]:
+    mapping = {
+        "none": 0,
+        "sleep": 1,
+        "hibernate": 2,
+        "shutdown": 3,
+        "keine aktion": 0,
+        "standbymodus": 1,
+        "herunterfahren": 3,
+    }
+    key = (action or "").strip().lower()
+    if key not in mapping:
+        return False, f"Unbekannte Aktion: {action}"
+    return _set_power_setting_index("SUB_BUTTONS", "LIDACTION", ac=ac, value=mapping[key])
+
+
 def read_display_timeout(ac: bool) -> SettingState:
     idx = _read_power_setting_index("SUB_VIDEO", "VIDEOIDLE", ac=ac)
     if idx is None:
@@ -612,12 +709,30 @@ def read_display_timeout(ac: bool) -> SettingState:
     return _state("Nie" if minutes == 0 else f"{minutes} Min")
 
 
+def apply_display_timeout(ac: bool, seconds: int) -> tuple[bool, str]:
+    minutes = 0 if seconds <= 0 else max(1, (int(seconds) + 59) // 60)
+    cmd = ["powercfg", "/change", "monitor-timeout-ac" if ac else "monitor-timeout-dc", str(minutes)]
+    res = _run(cmd, timeout=60)
+    if res.returncode != 0:
+        return False, ((res.stderr or "") + (res.stdout or "")).strip()[:300] or f"Code {res.returncode}"
+    return True, "OK"
+
+
 def read_sleep_timeout(ac: bool) -> SettingState:
     idx = _read_power_setting_index("SUB_SLEEP", "STANDBYIDLE", ac=ac)
     if idx is None:
         return _state("Nicht verfügbar", False, "STANDBYIDLE nicht lesbar.")
     minutes = 0 if idx == 0 else max(1, (idx + 59) // 60) if idx >= 60 else idx
     return _state("Nie" if minutes == 0 else f"{minutes} Min")
+
+
+def apply_sleep_timeout(ac: bool, minutes: int) -> tuple[bool, str]:
+    val = max(0, int(minutes))
+    cmd = ["powercfg", "/change", "standby-timeout-ac" if ac else "standby-timeout-dc", str(val)]
+    res = _run(cmd, timeout=60)
+    if res.returncode != 0:
+        return False, ((res.stderr or "") + (res.stdout or "")).strip()[:300] or f"Code {res.returncode}"
+    return True, "OK"
 
 
 def read_screensaver_state() -> ToggleReadResult:
@@ -651,6 +766,15 @@ def read_adaptive_brightness_state() -> SettingState:
     return _state("AN" if idx == 1 else "AUS")
 
 
+def apply_adaptive_brightness_state(enable: bool) -> tuple[bool, str]:
+    want = 1 if enable else 0
+    ok_ac, msg_ac = _set_power_setting_index("SUB_VIDEO", "ADAPTBRIGHT", ac=True, value=want)
+    ok_dc, msg_dc = _set_power_setting_index("SUB_VIDEO", "ADAPTBRIGHT", ac=False, value=want)
+    if not ok_ac and not ok_dc:
+        return False, msg_ac or msg_dc
+    return True, "OK"
+
+
 def read_usb_power_saving_state() -> SettingState:
     # USB selective suspend as closest safe proxy.
     idx = _read_power_setting_index("SUB_USB", "USBSELECTIVE SUSPEND", ac=True)
@@ -659,6 +783,24 @@ def read_usb_power_saving_state() -> SettingState:
     if idx is None:
         return _state("Nicht verfügbar", False, "USB-Energiesparen nicht lesbar.")
     return _state("AN" if idx == 1 else "AUS")
+
+
+def apply_usb_power_saving_state(enable: bool) -> tuple[bool, str]:
+    # Use common values for selective suspend: 1=enabled, 0=disabled.
+    want = 1 if enable else 0
+    scheme = active_power_scheme_guid()
+    if not scheme:
+        return False, "Aktives Schema nicht lesbar."
+    attempted = []
+    for setting in ("USBSELECTIVE SUSPEND", "USBSELECT"):
+        ok_ac, _ = _set_power_setting_index("SUB_USB", setting, ac=True, value=want)
+        ok_dc, _ = _set_power_setting_index("SUB_USB", setting, ac=False, value=want)
+        attempted.append(ok_ac or ok_dc)
+        if ok_ac or ok_dc:
+            return True, "OK"
+    if any(attempted):
+        return True, "OK"
+    return False, "USB-Energiesparen nicht unterstützt."
 
 
 def read_battery_saver_state() -> SettingState:

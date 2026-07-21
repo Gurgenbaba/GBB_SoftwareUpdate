@@ -34,7 +34,7 @@ def _relaunch_as_admin() -> bool:
 
 def main() -> None:
     if platform.system().lower() != "windows":
-        raise RuntimeError("GBB_SoftwareUpdater ist nur fuer Windows ausgelegt.")
+        raise RuntimeError("Compexx-InstallTool ist nur fuer Windows ausgelegt.")
     if not _is_admin():
         if _relaunch_as_admin():
             return

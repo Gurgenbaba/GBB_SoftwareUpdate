@@ -81,6 +81,10 @@ class SystemToolsService:
                 lines.append("Lokaler Benutzername umbenannt.")
                 effective_user = target
 
+        if any(c in target for c in ('"', '/', '\\', '[', ']', ':', '|', '=', ',', '+', '*', '?', '<', '>')):
+            return SystemActionResult(False, [*lines, "FEHLER: Ungueltige Zeichen im Vollnamen."])
+        if len(target) > 128:
+            return SystemActionResult(False, [*lines, "FEHLER: Vollname zu lang (max. 128 Zeichen)."])
         if dry_run:
             lines.append(f"[DRY-RUN] würde Kontovollname setzen: net user {effective_user} /fullname:{target}")
         else:
@@ -167,45 +171,69 @@ class SystemToolsService:
         return SystemActionResult(True, lines)
 
     def scan_windows_updates(self) -> SystemActionResult:
+        # ServerSelection=2 (ssWindowsUpdate) forces a query directly against Microsoft Update
+        # servers — same source as the Windows Settings app uses.  Without this, WUA queries
+        # the local cache or a configured WSUS server and may miss updates that are visible in
+        # the Windows UI.  Online=$true additionally bypasses any cached search results.
         script = (
             "$s=New-Object -ComObject Microsoft.Update.Session;"
+            "$s.ClientApplicationID='Compexx-InstallTool';"
             "$searcher=$s.CreateUpdateSearcher();"
+            "$searcher.Online=$true;"
+            "$searcher.ServerSelection=2;"
+            "try{"
             "$r=$searcher.Search(\"IsInstalled=0 and Type='Software'\");"
-            "if($r.Updates.Count -eq 0){'Keine Updates gefunden.'} else {"
+            "if($r.Updates.Count -eq 0){Write-Output 'Keine Updates gefunden.'} else {"
+            "Write-Output ('Gefunden: ' + $r.Updates.Count + ' Update(s)');"
             "for($i=0;$i -lt $r.Updates.Count;$i++){"
             "$u=$r.Updates.Item($i);"
-            "$kbs=($u.KBArticleIDs -join ',');"
-            "Write-Output (\"[{0}] {1} KB:{2}\" -f $i,$u.Title,$kbs)"
+            "$kbs=if($u.KBArticleIDs.Count){$u.KBArticleIDs -join ','}else{'–'};"
+            "$size=[math]::Round($u.MaxDownloadSize/1MB,1);"
+            "Write-Output (\"  [{0}] {1}  KB:{2}  ({3} MB)\" -f $i,$u.Title,$kbs,$size)"
             "}"
+            "}"
+            "}catch{"
+            "Write-Output ('Fehler bei der Suche: ' + $_.Exception.Message)"
             "}"
         )
-        res = self._run(["powershell", "-NoProfile", "-Command", script], timeout=300)
+        res = self._run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], timeout=300)
         lines = [line.strip() for line in (res.stdout or "").splitlines() if line.strip()]
         if not lines:
-            lines = [((res.stderr or "").strip() or "Keine Ausgabe.")]
-        return SystemActionResult(res.returncode == 0, lines)
+            err = (res.stderr or "").strip()
+            lines = [err[:400] if err else "Keine Ausgabe vom Update-Dienst."]
+        return SystemActionResult(res.returncode == 0 or bool(lines), lines)
 
     def install_windows_updates(self, dry_run: bool) -> SystemActionResult:
         if dry_run:
-            return SystemActionResult(True, ["[DRY-RUN] würde verfügbare Windows-Updates herunterladen und installieren."])
+            return SystemActionResult(True, ["[DRY-RUN] würde verfügbare Windows-Updates (Microsoft Update, online) herunterladen und installieren."])
         script = (
             "$s=New-Object -ComObject Microsoft.Update.Session;"
+            "$s.ClientApplicationID='Compexx-InstallTool';"
             "$searcher=$s.CreateUpdateSearcher();"
+            "$searcher.Online=$true;"
+            "$searcher.ServerSelection=2;"
+            "try{"
             "$r=$searcher.Search(\"IsInstalled=0 and Type='Software'\");"
             "if($r.Updates.Count -eq 0){Write-Output 'Keine Updates zu installieren.'; exit 0};"
+            "Write-Output ('Gefunden: ' + $r.Updates.Count + ' Update(s) – starte Download...');"
             "$c=New-Object -ComObject Microsoft.Update.UpdateColl;"
             "for($i=0;$i -lt $r.Updates.Count;$i++){[void]$c.Add($r.Updates.Item($i))};"
             "$d=$s.CreateUpdateDownloader();$d.Updates=$c;$dr=$d.Download();"
-            "Write-Output ('Download Ergebnis: ' + $dr.ResultCode);"
-            "$i2=$s.CreateUpdateInstaller();$i2.Updates=$c;$ir=$i2.Install();"
-            "Write-Output ('Install Ergebnis: ' + $ir.ResultCode);"
-            "Write-Output ('Reboot erforderlich: ' + $ir.RebootRequired)"
+            "Write-Output ('Download ResultCode: ' + $dr.ResultCode);"
+            "$inst=$s.CreateUpdateInstaller();$inst.Updates=$c;$ir=$inst.Install();"
+            "Write-Output ('Install ResultCode: ' + $ir.ResultCode);"
+            "Write-Output ('Neustart erforderlich: ' + $ir.RebootRequired)"
+            "}catch{"
+            "Write-Output ('Fehler: ' + $_.Exception.Message)"
+            "}"
         )
-        res = self._run(["powershell", "-NoProfile", "-Command", script], timeout=1800)
+        res = self._run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], timeout=1800)
         lines = [line.strip() for line in (res.stdout or "").splitlines() if line.strip()]
         if res.stderr:
-            lines.append((res.stderr or "").strip()[:400])
-        return SystemActionResult(res.returncode == 0, lines or ["Keine Ausgabe."])
+            err = (res.stderr or "").strip()
+            if err:
+                lines.append(err[:400])
+        return SystemActionResult(res.returncode == 0 or bool(lines), lines or ["Keine Ausgabe."])
 
     def profile_migration_precheck(self, source_user: str, target_profile_name: str) -> SystemActionResult:
         current_user = getpass.getuser()
