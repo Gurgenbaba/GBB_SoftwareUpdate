@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import subprocess
 from dataclasses import replace
 from datetime import datetime
@@ -19,6 +20,19 @@ ProviderId = Literal["local", "choco", "winget", "internal"]
 
 _DEFAULT_PRIORITY: tuple[ProviderId, ...] = ("choco", "winget", "internal", "local")
 _AVAYA_PRIORITY: tuple[ProviderId, ...] = ("winget", "internal", "choco", "local")
+
+
+def _console_encoding() -> str:
+    """OEM-Konsolen-Codepage statt ANSI/CP1252 (z. B. Deutsch meist CP850) — sonst stirbt der
+    subprocess-Reader-Thread mit UnicodeDecodeError und die Ausgabe geht verloren."""
+    if platform.system() != "Windows":
+        return "utf-8"
+    try:
+        import ctypes
+
+        return f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+    except Exception:
+        return "cp850"
 
 
 def parse_provider_priority(raw_cfg: dict[str, Any], *, software_key: str, prefer_local: bool) -> tuple[ProviderId, ...]:
@@ -109,6 +123,8 @@ def try_restore_point_or_registry_export(logger, *, reports_dir: Path) -> tuple[
             ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
             capture_output=True,
             text=True,
+            encoding=_console_encoding(),
+            errors="replace",
             timeout=120,
             check=False,
             shell=False,
@@ -126,6 +142,8 @@ def try_restore_point_or_registry_export(logger, *, reports_dir: Path) -> tuple[
                 ["reg", "export", "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall", str(out_reg), "/y"],
                 capture_output=True,
                 text=True,
+                encoding=_console_encoding(),
+                errors="replace",
                 timeout=60,
                 check=False,
                 shell=False,

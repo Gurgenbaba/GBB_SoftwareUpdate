@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob
 import os
+import platform
 import queue
 import shutil
 import subprocess
@@ -16,6 +17,19 @@ except ImportError:  # pragma: no cover
     winreg = None
 
 from .models import ReportEntry
+
+
+def _console_encoding() -> str:
+    """OEM-Konsolen-Codepage statt ANSI/CP1252 (z. B. Deutsch meist CP850) — sonst stirbt der
+    subprocess-Reader-Thread mit UnicodeDecodeError und die Ausgabe geht verloren."""
+    if platform.system() != "Windows":
+        return "utf-8"
+    try:
+        import ctypes
+
+        return f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+    except Exception:
+        return "cp850"
 
 _HIVE_MAP = {
     "HKLM": lambda: winreg.HKEY_LOCAL_MACHINE if winreg else None,
@@ -282,6 +296,8 @@ def _delete_registry_target(full: str, logger) -> bool:
             ["reg", "delete", full, "/f"],
             capture_output=True,
             text=True,
+            encoding=_console_encoding(),
+            errors="replace",
             timeout=60,
             check=False,
             shell=False,

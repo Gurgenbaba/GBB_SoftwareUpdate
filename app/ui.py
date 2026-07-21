@@ -256,7 +256,7 @@ class UpdaterApp(ctk.CTk):
         self._col_resize_drag: tuple[str, str, int] | None = None
         self.content_split_grip: ctk.CTkFrame | None = None
         self._content_split_override_px: int | None = None
-        self._content_split_drag: tuple[int, int] | None = None
+        self._content_split_drag: tuple[int, int, int] | None = None
         self._history_scroll_height: int = 48
         self._history_split_drag: tuple[int, int] | None = None
         self._system_settings_win: ctk.CTkToplevel | None = None
@@ -564,13 +564,13 @@ class UpdaterApp(ctk.CTk):
         # Softwareliste deutlich breiter als Log-Spalte (Aktionen liegen über dem Log).
         # Spalte 1 ist der schmale, ziehbare Trenngriff zwischen Liste (0) und Log (2).
         content.grid_columnconfigure(0, weight=5)
-        content.grid_columnconfigure(1, weight=0, minsize=6)
+        content.grid_columnconfigure(1, weight=0, minsize=10)
         content.grid_columnconfigure(2, weight=1)
         content.grid_rowconfigure(0, weight=0)
         content.grid_rowconfigure(1, weight=1, minsize=200)
         content.grid_rowconfigure(2, weight=0)
 
-        self.content_split_grip = ctk.CTkFrame(content, width=6, fg_color=self.ogx_colors["border"], corner_radius=1)
+        self.content_split_grip = ctk.CTkFrame(content, width=10, fg_color=self.ogx_colors["border"], corner_radius=1)
         self.content_split_grip.grid(row=0, column=1, rowspan=2, sticky="ns", pady=6)
         try:
             self.content_split_grip.configure(cursor="sb_h_double_arrow")
@@ -914,8 +914,8 @@ class UpdaterApp(ctk.CTk):
         self.history_frame.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 4))
         self.history_frame.grid_columnconfigure(1, weight=1)
         self.history_frame.grid_columnconfigure(2, weight=0)
-        history_split_grip = ctk.CTkFrame(self.history_frame, height=5, fg_color=self.ogx_colors["border"], corner_radius=1)
-        history_split_grip.grid(row=0, column=0, columnspan=3, sticky="ew", padx=40, pady=(4, 0))
+        history_split_grip = ctk.CTkFrame(self.history_frame, height=8, fg_color=self.ogx_colors["border"], corner_radius=1)
+        history_split_grip.grid(row=0, column=0, columnspan=3, sticky="ew", padx=16, pady=(4, 0))
         try:
             history_split_grip.configure(cursor="sb_v_double_arrow")
         except Exception:
@@ -1092,13 +1092,15 @@ class UpdaterApp(ctk.CTk):
     def _apply_toolbar_layout(self, layout_w: int) -> None:
         if self.button_frame is None or not self._toolbar_groups:
             return
-        # Breit: 6×, mittel: 4×, schmal: 2× Spalten pro Gruppe — bezogen auf Log-Spalte (button_host im log_frame).
+        # Breit: 6×, mittel: 4×, schmal: 2×, sehr schmal (z. B. per Trenngriff gezogen): 1× Spalte.
         if layout_w >= 1240:
             cols_pref = 6
         elif layout_w >= 720:
             cols_pref = 4
-        else:
+        elif layout_w >= 340:
             cols_pref = 2
+        else:
+            cols_pref = 1
         if self._toolbar_cols == cols_pref:
             return
         self._toolbar_cols = cols_pref
@@ -1193,18 +1195,21 @@ class UpdaterApp(ctk.CTk):
     def _total_column_width(self) -> int:
         return sum(int(self._ui_column_widths.get(k, 0)) for k in UI_COLUMN_KEYS)
 
-    def _fit_columns_to_available_width(self) -> None:
-        if self.software_list_frame is None:
-            return
-        canvas = getattr(self.software_list_frame, "_parent_canvas", None)
-        if canvas is None:
-            return
-        try:
-            avail = int(canvas.winfo_width()) - 18
-        except Exception:
-            return
-        if avail < 320:
-            return
+    def _fit_columns_to_available_width(self, avail_override: int | None = None) -> None:
+        if avail_override is not None:
+            avail = avail_override
+        else:
+            if self.software_list_frame is None:
+                return
+            canvas = getattr(self.software_list_frame, "_parent_canvas", None)
+            if canvas is None:
+                return
+            try:
+                avail = int(canvas.winfo_width()) - 18
+            except Exception:
+                return
+            if avail < 320:
+                return
         total = self._total_column_width()
         if total <= avail:
             return
@@ -1261,24 +1266,60 @@ class UpdaterApp(ctk.CTk):
         self._apply_software_column_widths()
         self._on_column_resize_end()
 
+    def _toolbar_min_width(self) -> int:
+        """Wirkliche Mindestbreite der Log-/Toolbar-Spalte: breitester Button (1 pro Zeile) + Innenabstand."""
+        widest = 0
+        for _title, _grid_frame, buttons in self._toolbar_groups:
+            for btn in buttons:
+                try:
+                    widest = max(widest, int(btn.winfo_reqwidth()))
+                except Exception:
+                    pass
+        if widest <= 0:
+            widest = 160
+        return widest + 28
+
+    def _software_table_min_width(self) -> int:
+        """Wirkliche Mindestbreite der Softwareliste: Summe der Mindest-Spaltenbreiten + Puffer."""
+        return sum(int(MIN_UI_COLUMNS[k]) for k in UI_COLUMN_KEYS) + 24
+
     def _on_content_split_start(self, event: object) -> None:
+        if self.content_frame is None or self.software_list_frame is None:
+            return
+        self.content_frame.update_idletasks()
         try:
             start_w = int(self.software_list_frame.winfo_width())
         except Exception:
             start_w = 0
-        self._content_split_drag = (int(getattr(event, "x_root", 0)), max(start_w, 1))
+        try:
+            total = max(int(self.content_frame.winfo_width()) - 10, 400)
+        except Exception:
+            total = 1200
+        # (x_root beim Start, Breite Softwareliste beim Start, verfuegbare Gesamtbreite — waehrend
+        # des Ziehens konstant, da sich nur das Verhaeltnis aendert, nicht die Fensterbreite).
+        self._content_split_drag = (int(getattr(event, "x_root", 0)), max(start_w, 1), total)
 
     def _on_content_split_motion(self, event: object) -> None:
         drag = self._content_split_drag
         if drag is None or self.content_frame is None:
             return
-        x0, start_w = drag
+        x0, start_w, total = drag
         cur_x = int(getattr(event, "x_root", x0))
         delta = cur_x - x0
-        self._content_split_override_px = max(240, start_w + delta)
-        w0, w1 = self._content_col_weights(False)
-        self.content_frame.grid_columnconfigure(0, weight=w0)
-        self.content_frame.grid_columnconfigure(2, weight=w1)
+        min0 = self._software_table_min_width()
+        min1 = self._toolbar_min_width()
+        new_w0 = max(min0, min(max(total - min1, min0), start_w + delta))
+        new_w1 = max(min1, total - new_w0)
+        self._content_split_override_px = new_w0
+        # Toolbar und Tabellenspalten zuerst auf die Zielbreite umbrechen: die CTkScrollableFrame
+        # der Softwareliste erzwingt sonst KEINE Mindestbreite selbst (im Gegensatz zum Log-Frame),
+        # wodurch Spalten beim Schrumpfen ueberlappen/verschwinden koennten statt sich anzupassen.
+        self._apply_toolbar_layout(new_w1)
+        self._fit_columns_to_available_width(new_w0 - 18)
+        self._apply_software_column_widths()
+        self.content_frame.grid_columnconfigure(0, weight=new_w0)
+        self.content_frame.grid_columnconfigure(2, weight=new_w1)
+        self.content_frame.update_idletasks()
 
     def _on_content_split_end(self, _event: object = None) -> None:
         self._content_split_drag = None
@@ -1292,8 +1333,18 @@ class UpdaterApp(ctk.CTk):
         except Exception:
             width = 1360
         self._apply_width_layout(width)
+        if self.content_frame is not None:
+            self.content_frame.update_idletasks()
+        self._apply_toolbar_layout(self._toolbar_reference_width(width))
+        self._fit_columns_to_available_width()
+        self._apply_software_column_widths()
 
     def _on_history_split_start(self, event: object) -> None:
+        if not self._history_expanded:
+            self._history_expanded = True
+            self._set_history_details_visible(True)
+        if self.history_frame is not None:
+            self.history_frame.update_idletasks()
         self._history_split_drag = (int(getattr(event, "y_root", 0)), int(self._history_scroll_height))
 
     def _on_history_split_motion(self, event: object) -> None:
@@ -1307,6 +1358,7 @@ class UpdaterApp(ctk.CTk):
         new_h = max(32, min(320, start_h + delta))
         self._history_scroll_height = new_h
         self.history_scroll.configure(height=new_h)
+        self.history_scroll.update_idletasks()
 
     def _on_history_split_end(self, _event: object = None) -> None:
         self._history_split_drag = None
@@ -1351,8 +1403,17 @@ class UpdaterApp(ctk.CTk):
         self._history_expanded = not self._history_expanded
         if self._compact_mode:
             self._set_history_details_visible(False)
+        else:
+            self._set_history_details_visible(self._history_expanded)
+        # Erzwingt ein konsistentes Neuanwenden von Spaltenaufteilung und Toolbar-Umbruch,
+        # falls sich durch das Auf-/Zuklappen die verfuegbare Breite/Hoehe minimal veraendert hat.
+        try:
+            width = int(self.winfo_width())
+            height = int(self.winfo_height())
+        except Exception:
             return
-        self._set_history_details_visible(self._history_expanded)
+        if width > 160 and height > 160:
+            self._apply_responsive_layout(width, height)
 
     def _style_special_action_buttons(self) -> None:
         if self.energy_screensaver_btn is not None:
@@ -1391,13 +1452,15 @@ class UpdaterApp(ctk.CTk):
         """Liefert (Softwareliste, Log) Spaltengewichte — respektiert eine per Griff gezogene Nutzer-Aufteilung."""
         if self._content_split_override_px is not None and self.content_frame is not None:
             try:
-                total = max(int(self.content_frame.winfo_width()) - 6, 0)
+                total = max(int(self.content_frame.winfo_width()) - 10, 0)
             except Exception:
                 total = 0
             if total < 400:
                 total = 1200
-            w0 = max(240, min(total - 200, int(self._content_split_override_px)))
-            w1 = max(120, total - w0)
+            min0 = self._software_table_min_width()
+            min1 = self._toolbar_min_width()
+            w0 = max(min0, min(max(total - min1, min0), int(self._content_split_override_px)))
+            w1 = max(min1, total - w0)
             return w0, w1
         return (7, 1) if want_wide_split else (5, 1)
 

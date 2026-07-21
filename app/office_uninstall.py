@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import shlex
 import subprocess
 import tempfile
@@ -14,6 +15,19 @@ from typing import Any, Callable, Literal, Sequence
 EXCERPT_LEN = 600
 
 RunCmd = Callable[..., Any]
+
+
+def _console_encoding() -> str:
+    """OEM-Konsolen-Codepage statt ANSI/CP1252 (z. B. Deutsch meist CP850) — sonst stirbt der
+    subprocess-Reader-Thread mit UnicodeDecodeError und die Ausgabe geht verloren."""
+    if platform.system() != "Windows":
+        return "utf-8"
+    try:
+        import ctypes
+
+        return f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+    except Exception:
+        return "cp850"
 
 # Safe Office apps to stop before removal (no ClickToRunSvc unless explicitly requested in config).
 _OFFICE_KILL_NAMES: tuple[str, ...] = (
@@ -105,6 +119,8 @@ def stop_safe_office_processes(
                 ["taskkill", "/IM", name, "/F"],
                 capture_output=True,
                 text=True,
+                encoding=_console_encoding(),
+                errors="replace",
                 timeout=60,
                 check=False,
                 shell=False,
@@ -119,6 +135,8 @@ def stop_safe_office_processes(
                 ["sc", "stop", "ClickToRunSvc"],
                 capture_output=True,
                 text=True,
+                encoding=_console_encoding(),
+                errors="replace",
                 timeout=120,
                 check=False,
                 shell=False,
@@ -174,6 +192,8 @@ def try_get_help_office_scrub(
             cwd=str(get_help_exe.parent),
             capture_output=True,
             text=True,
+            encoding=_console_encoding(),
+            errors="replace",
             timeout=7200,
             check=False,
             shell=False,
@@ -231,6 +251,8 @@ def try_odt_remove(
             cwd=cwd,
             capture_output=True,
             text=True,
+            encoding=_console_encoding(),
+            errors="replace",
             timeout=3600,
             check=False,
             shell=False,
@@ -287,6 +309,8 @@ def try_sara_remove(
             cwd=str(exe.parent),
             capture_output=True,
             text=True,
+            encoding=_console_encoding(),
+            errors="replace",
             timeout=3600,
             check=False,
             shell=False,

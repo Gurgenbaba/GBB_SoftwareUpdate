@@ -32,12 +32,28 @@ class SystemToolsService:
             startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
         return {"creationflags": creationflags, "startupinfo": startupinfo}
 
+    @staticmethod
+    def _console_encoding() -> str:
+        """OEM-Konsolen-Codepage statt ANSI/CP1252 — z. B. Deutsch meist CP850. Bei Mismatch
+        stirbt sonst der subprocess-Reader-Thread mit UnicodeDecodeError und die Ausgabe geht
+        verloren (Aktion erscheint faelschlich als fehlgeschlagen/leer)."""
+        if platform.system() != "Windows":
+            return "utf-8"
+        try:
+            import ctypes
+
+            return f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+        except Exception:
+            return "cp850"
+
     def _run(self, cmd: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
         return subprocess.run(
             cmd,
             check=False,
             capture_output=True,
             text=True,
+            encoding=self._console_encoding(),
+            errors="replace",
             timeout=timeout,
             shell=False,
             **self._hidden_kwargs(),

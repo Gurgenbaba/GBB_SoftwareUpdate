@@ -5,6 +5,7 @@ import fnmatch
 import hashlib
 import io
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -325,6 +326,17 @@ class InstallerService:
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
         return {"creationflags": creationflags, "startupinfo": startupinfo}
+
+    @staticmethod
+    def _console_encoding() -> str:
+        """OEM-Konsolen-Codepage statt ANSI/CP1252 (z. B. Deutsch meist CP850) — sonst stirbt der
+        subprocess-Reader-Thread mit UnicodeDecodeError und die Ausgabe geht verloren."""
+        if platform.system() != "Windows":
+            return "utf-8"
+        try:
+            return f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+        except Exception:
+            return "cp850"
 
     def precheck_sources(
         self,
@@ -1516,6 +1528,8 @@ class InstallerService:
             cmd,
             capture_output=True,
             text=True,
+            encoding=self._console_encoding(),
+            errors="replace",
             check=False,
             timeout=INSTALL_TIMEOUT_SECONDS,
             shell=False,
@@ -1532,6 +1546,8 @@ class InstallerService:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding=self._console_encoding(),
+                errors="replace",
                 check=False,
                 timeout=INSTALL_TIMEOUT_SECONDS,
                 shell=False,
@@ -1833,6 +1849,8 @@ class InstallerService:
                 ["tasklist", "/FO", "CSV", "/NH"],
                 capture_output=True,
                 text=True,
+                encoding=InstallerService._console_encoding(),
+                errors="replace",
                 check=False,
                 timeout=10,
                 shell=False,

@@ -123,12 +123,29 @@ def _hidden_kwargs() -> dict:
     return {"creationflags": creationflags, "startupinfo": startupinfo}
 
 
+def _console_encoding() -> str:
+    """Konsolen-Codepage (OEM), nicht die ANSI/CP1252-Systemcodepage: powercfg & Co. schreiben
+    auf die OEM-Codepage. Auf deutschsprachigem Windows ist das meist CP850, nicht CP1252 —
+    bestimmte Umlaute/Sonderzeichen fuehren sonst zu UnicodeDecodeError im subprocess-Reader-
+    Thread und die Ausgabe geht verloren (Einstellung erscheint faelschlich als nicht lesbar)."""
+    if platform.system() != "Windows":
+        return "utf-8"
+    try:
+        import ctypes
+
+        return f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+    except Exception:
+        return "cp850"
+
+
 def _run(cmd: list[str], timeout: int = 90) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
         check=False,
         capture_output=True,
         text=True,
+        encoding=_console_encoding(),
+        errors="replace",
         timeout=timeout,
         shell=False,
         **_hidden_kwargs(),
@@ -210,9 +227,14 @@ def apply_dark_mode(want_dark: bool, logger: logging.Logger | None = None) -> tu
     return True, "OK"
 
 
+_GUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
 def _parse_powercfg_minutes(block: str, prefer: str = "AC") -> int | None:
     """Extract timeout minutes from powercfg /query output (locale tolerant)."""
-    lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+    # GUID-Zeilen (Schema-/Setting-Header) enthalten oft Ziffernfragmente vor einem Hex-Buchstaben
+    # (z. B. "381b4222-..."), die sonst faelschlich als Minutenwert erkannt wuerden.
+    lines = [ln.strip() for ln in block.splitlines() if ln.strip() and not _GUID_RE.search(ln)]
     pick: list[str] = []
     for ln in lines:
         u = ln.upper()
@@ -230,7 +252,7 @@ def _parse_powercfg_minutes(block: str, prefer: str = "AC") -> int | None:
                 return v
             except ValueError:
                 continue
-        m = re.search(r"(\d{1,5})\s*(?:Min|min|Minute|MINUTE|minutes|Minutes)?", ln)
+        m = re.search(r"(\d{1,5})\s*(?:Min|min|Minute|MINUTE|minutes|Minutes)", ln)
         if m:
             try:
                 return int(m.group(1))
@@ -254,6 +276,26 @@ def _parse_ac_setting_index_hex(block: str) -> int | None:
         except ValueError:
             continue
     return None
+
+
+def _parse_dc_setting_index_hex(block: str) -> int | None:
+    """Zweite 'Index der aktuellen ...einstellung: 0x....'-Zeile (DC/Akku) anhand der
+    Reihenfolge, nicht anhand von Schluesselwoertern wie 'dc'/'battery' (die in lokalisierter
+    powercfg-Ausgabe, z. B. Deutsch 'Gleichstromeinstellung', nicht vorkommen)."""
+    values: list[int] = []
+    for ln in block.splitlines():
+        if "index" not in ln.lower():
+            continue
+        m = re.search(r"0x([0-9a-fA-F]{1,8})\b", ln, re.I)
+        if not m:
+            continue
+        try:
+            values.append(int(m.group(1), 16))
+        except ValueError:
+            continue
+        if len(values) >= 2:
+            break
+    return values[1] if len(values) >= 2 else None
 
 
 def _video_idle_ac_minutes(block: str) -> int | None:
@@ -508,31 +550,25 @@ def _read_power_setting_index(subgroup: str, setting: str, *, ac: bool) -> int |
     block = _query_power_line(subgroup, setting, scheme)
     if not block:
         return None
+    # Existiert die Einstellung auf diesem System/Schema nicht (z. B. PBUTTONACTION/LIDACTION
+    # auf manchen Desktops/verwalteten Images), liefert powercfg nur den Schema-Header ohne
+    # eine "Index der aktuellen ...einstellung"-Zeile zurueck. Dann sauber "nicht verfuegbar"
+    # melden statt Ziffernfragmente aus dem GUID-Header als Wert misszudeuten.
+    if not re.search(r"index", block, re.I):
+        return None
     if ac:
         idx = _parse_ac_setting_index_hex(block)
         if idx is not None:
             return idx
         return _parse_powercfg_minutes(block, "AC")
-    dc_block = "\n".join(ln for ln in block.splitlines() if "dc" in ln.lower() or "battery" in ln.lower())
-    idx_dc = _parse_ac_setting_index_hex(dc_block)
+    # Nicht per "dc"/"battery"-Substring filtern: die deutsche powercfg-Ausgabe verwendet
+    # "Gleichstromeinstellung", das weder "dc" noch "battery" enthaelt. powercfg listet pro
+    # Einstellung stattdessen immer zuerst die AC- (Wechselstrom-), dann die DC-Zeile
+    # (Gleichstrom/Akku) — das ist locale-unabhaengig und robuster als Schluesselwoerter.
+    idx_dc = _parse_dc_setting_index_hex(block)
     if idx_dc is not None:
         return idx_dc
-    for ln in block.splitlines():
-        if "dc" not in ln.lower() and "battery" not in ln.lower():
-            continue
-        m = re.search(r"0x([0-9a-fA-F]{1,8})\b", ln, re.I)
-        if m:
-            try:
-                return int(m.group(1), 16)
-            except ValueError:
-                pass
-        m2 = re.search(r"(\d{1,8})", ln)
-        if m2:
-            try:
-                return int(m2.group(1))
-            except ValueError:
-                pass
-    return None
+    return _parse_powercfg_minutes(block, "DC")
 
 
 def _set_power_setting_index(subgroup: str, setting: str, *, ac: bool, value: int) -> tuple[bool, str]:
@@ -775,11 +811,21 @@ def apply_adaptive_brightness_state(enable: bool) -> tuple[bool, str]:
     return True, "OK"
 
 
+
+# SUB_USB / "USBSELECTIVE SUSPEND" sind auf vielen Systemen keine registrierten powercfg-Aliase
+# (fehlen z. B. in `powercfg /aliases`) — die GUIDs sind stabil ueber Windows-Version/Sprache
+# hinweg und funktionieren immer als Fallback.
+_SUB_USB_GUID = "2a737441-1930-4402-8d77-b2bebba308a3"
+_USB_SELECTIVE_SUSPEND_GUID = "48e6b7a6-50f5-4782-a5d4-53bb8f07e226"
+
+
 def read_usb_power_saving_state() -> SettingState:
     # USB selective suspend as closest safe proxy.
     idx = _read_power_setting_index("SUB_USB", "USBSELECTIVE SUSPEND", ac=True)
     if idx is None:
         idx = _read_power_setting_index("SUB_USB", "USBSELECT", ac=True)
+    if idx is None:
+        idx = _read_power_setting_index(_SUB_USB_GUID, _USB_SELECTIVE_SUSPEND_GUID, ac=True)
     if idx is None:
         return _state("Nicht verfügbar", False, "USB-Energiesparen nicht lesbar.")
     return _state("AN" if idx == 1 else "AUS")
@@ -792,9 +838,13 @@ def apply_usb_power_saving_state(enable: bool) -> tuple[bool, str]:
     if not scheme:
         return False, "Aktives Schema nicht lesbar."
     attempted = []
-    for setting in ("USBSELECTIVE SUSPEND", "USBSELECT"):
-        ok_ac, _ = _set_power_setting_index("SUB_USB", setting, ac=True, value=want)
-        ok_dc, _ = _set_power_setting_index("SUB_USB", setting, ac=False, value=want)
+    for subgroup, setting in (
+        ("SUB_USB", "USBSELECTIVE SUSPEND"),
+        ("SUB_USB", "USBSELECT"),
+        (_SUB_USB_GUID, _USB_SELECTIVE_SUSPEND_GUID),
+    ):
+        ok_ac, _ = _set_power_setting_index(subgroup, setting, ac=True, value=want)
+        ok_dc, _ = _set_power_setting_index(subgroup, setting, ac=False, value=want)
         attempted.append(ok_ac or ok_dc)
         if ok_ac or ok_dc:
             return True, "OK"

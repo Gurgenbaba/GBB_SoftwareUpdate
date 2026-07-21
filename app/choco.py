@@ -87,6 +87,19 @@ class ChocoClient:
             startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
         return {"creationflags": creationflags, "startupinfo": startupinfo}
 
+    @staticmethod
+    def _console_encoding() -> str:
+        """OEM-Konsolen-Codepage statt ANSI/CP1252 (z. B. Deutsch meist CP850) — sonst stirbt der
+        subprocess-Reader-Thread mit UnicodeDecodeError und die Ausgabe geht verloren."""
+        if platform.system() != "Windows":
+            return "utf-8"
+        try:
+            import ctypes
+
+            return f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+        except Exception:
+            return "cp850"
+
     def run(
         self,
         args: list[str],
@@ -103,6 +116,8 @@ class ChocoClient:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding=self._console_encoding(),
+                errors="replace",
                 timeout=timeout,
                 check=False,
                 shell=False,
@@ -153,6 +168,8 @@ class ChocoClient:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding=self._console_encoding(),
+                errors="replace",
                 timeout=CHOCO_INSTALL_TIMEOUT_SECONDS,
                 check=False,
                 shell=False,

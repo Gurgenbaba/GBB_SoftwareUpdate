@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import re
 import shlex
 import subprocess
@@ -16,6 +17,19 @@ except ImportError:  # pragma: no cover - Windows only
 from .config import SOFTWARE_ALIASES, SOFTWARE_CATALOG, SoftwarePackage
 from .identity import detect_choco_with_identity, registry_match_with_identity
 from .models import SoftwareState
+
+
+def _console_encoding() -> str:
+    """OEM-Konsolen-Codepage statt ANSI/CP1252 (z. B. Deutsch meist CP850) — sonst stirbt der
+    subprocess-Reader-Thread mit UnicodeDecodeError und die Ausgabe geht verloren."""
+    if platform.system() != "Windows":
+        return "utf-8"
+    try:
+        import ctypes
+
+        return f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+    except Exception:
+        return "cp850"
 
 # Phrase-only registry display matching (substring, lowercased). Avoids "teams" matching "TeamSpeak".
 _REGISTRY_STRICT_DISPLAY_PHRASES: dict[str, tuple[str, ...]] = {
@@ -359,6 +373,8 @@ class SoftwareScanner:
                 ["tasklist", "/FO", "CSV", "/NH"],
                 capture_output=True,
                 text=True,
+                encoding=_console_encoding(),
+                errors="replace",
                 timeout=45,
                 check=False,
                 shell=False,
@@ -421,6 +437,8 @@ class SoftwareScanner:
                 ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
                 capture_output=True,
                 text=True,
+                encoding=_console_encoding(),
+                errors="replace",
                 timeout=45,
                 check=False,
                 shell=False,
@@ -469,6 +487,8 @@ class SoftwareScanner:
                 ["sc", "query", "OfficeClickToRun"],
                 capture_output=True,
                 text=True,
+                encoding=_console_encoding(),
+                errors="replace",
                 timeout=20,
                 check=False,
                 shell=False,

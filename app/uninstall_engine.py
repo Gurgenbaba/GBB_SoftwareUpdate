@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import platform
 import shlex
 import subprocess
 import os
@@ -29,6 +30,19 @@ from .office_uninstall import (
 from .scanner import PostUninstallVerification, SoftwareScanner
 
 EXCERPT_LEN = 600
+
+
+def _console_encoding() -> str:
+    """OEM-Konsolen-Codepage statt ANSI/CP1252 (z. B. Deutsch meist CP850) — sonst stirbt der
+    subprocess-Reader-Thread mit UnicodeDecodeError und die Ausgabe geht verloren."""
+    if platform.system() != "Windows":
+        return "utf-8"
+    try:
+        import ctypes
+
+        return f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+    except Exception:
+        return "cp850"
 
 _DEFAULT_UNINSTALL: dict[str, dict[str, Any]] = {
     "citrix_workspace": {
@@ -225,6 +239,8 @@ def run_uninstall_command(
             timeout=timeout,
             capture_output=True,
             text=True,
+            encoding=_console_encoding(),
+            errors="replace",
             shell=False,
             cwd=cwd,
         )
@@ -960,6 +976,8 @@ class MultiStageUninstallEngine:
                 ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
                 capture_output=True,
                 text=True,
+                encoding=_console_encoding(),
+                errors="replace",
                 check=False,
                 timeout=600,
                 shell=False,
@@ -1021,6 +1039,8 @@ class MultiStageUninstallEngine:
                     timeout=900,
                     capture_output=True,
                     text=True,
+                    encoding=_console_encoding(),
+                    errors="replace",
                     shell=False,
                     cwd=str(exe_path.parent),
                 )
@@ -1089,6 +1109,8 @@ class MultiStageUninstallEngine:
                 timeout=INSTALL_TIMEOUT_SECONDS,
                 capture_output=True,
                 text=True,
+                encoding=_console_encoding(),
+                errors="replace",
                 shell=False,
                 cwd=str(exe.parent),
             )
@@ -1206,6 +1228,8 @@ class MultiStageUninstallEngine:
                     timeout=INSTALL_TIMEOUT_SECONDS,
                     capture_output=True,
                     text=True,
+                    encoding=_console_encoding(),
+                    errors="replace",
                     shell=False,
                     cwd=str(exe0.parent) if exe0.is_file() else None,
                 )
@@ -1461,6 +1485,8 @@ class MultiStageUninstallEngine:
                 ["tasklist", "/FO", "CSV", "/NH"],
                 capture_output=True,
                 text=True,
+                encoding=_console_encoding(),
+                errors="replace",
                 check=False,
                 timeout=20,
                 shell=False,
@@ -1483,7 +1509,16 @@ class MultiStageUninstallEngine:
                 killed += 1
                 continue
             cmd = ["taskkill", "/F", "/IM", proc_name, "/T"]
-            res = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=20, shell=False)
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding=_console_encoding(),
+                errors="replace",
+                check=False,
+                timeout=20,
+                shell=False,
+            )
             if res.returncode == 0:
                 killed += 1
             else:
