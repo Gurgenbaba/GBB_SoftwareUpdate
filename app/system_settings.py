@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import logging
 import platform
 import re
@@ -17,8 +18,8 @@ GUID_BALANCED = "381b4222-f694-41f0-9685-ff5bb260df2e"
 GUID_HIGH = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
 
 DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
-    "display_timeout_seconds": 900,
-    "sleep_timeout_minutes": 15,
+    "display_timeout_seconds": 0,
+    "sleep_timeout_minutes": 0,
     "power_profile": "balanced",
     "dark_mode_enabled": True,
     "screensaver_disabled": True,
@@ -27,10 +28,12 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "dc_lid_action": "none",
     "ac_power_button_action": "sleep",
     "dc_power_button_action": "sleep",
-    "ac_standby_disabled": False,
-    "dc_standby_disabled": False,
+    "ac_standby_disabled": True,
+    "dc_standby_disabled": True,
     "adaptive_brightness_enabled": True,
     "usb_power_saving_enabled": True,
+    "ac_power_mode": "best_performance",
+    "dc_power_mode": "balanced",
 }
 
 DEFAULT_UI_COLUMNS: dict[str, int] = {
@@ -194,6 +197,36 @@ def read_dark_mode() -> ToggleReadResult:
         return ToggleReadResult(False, False, f"Registry nicht lesbar: {exc}")
 
 
+def _broadcast_setting_change(param: str) -> None:
+    """Sendet eine WM_SETTINGCHANGE-Broadcast-Nachricht an alle Top-Level-Fenster.
+
+    Wichtig: SendMessageTimeout (synchron, wartet auf alle Empfaenger), nicht PostMessage
+    (asynchron). PostMessage mit einem String-lParam ist fuer einen Prozess-uebergreifenden
+    Broadcast unsicher — der String zeigt auf Speicher dieses Prozesses, der nach Rueckkehr aus
+    PostMessage bereits ungueltig sein kann, bevor andere Prozesse ihn lesen. Das fuehrte dazu,
+    dass z. B. der Explorer die neue Theme-Einstellung aufnahm, andere Shell-Komponenten aber
+    nicht — sichtbar als "halb Hell/halb Dunkel"-Zustand nach dem Umschalten.
+    """
+    if winreg is None or platform.system() != "Windows":
+        return
+    try:
+        hwnd_broadcast = 0xFFFF
+        wm_settingchange = 0x1A
+        smto_abortifhung = 0x0002
+        result = ctypes.c_ulong()
+        ctypes.windll.user32.SendMessageTimeoutW(
+            ctypes.c_void_p(hwnd_broadcast),
+            wm_settingchange,
+            ctypes.c_void_p(0),
+            param,
+            smto_abortifhung,
+            2000,
+            ctypes.byref(result),
+        )
+    except Exception:  # pylint: disable=broad-except
+        pass
+
+
 def apply_dark_mode(want_dark: bool, logger: logging.Logger | None = None) -> tuple[bool, str]:
     if winreg is None or platform.system() != "Windows":
         return False, "Nur unter Windows verfügbar."
@@ -211,19 +244,10 @@ def apply_dark_mode(want_dark: bool, logger: logging.Logger | None = None) -> tu
         if logger:
             logger.warning("Dark mode registry: %s", exc)
         return False, str(exc)
-    # Best-effort refresh (ignore failures)
-    _run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-Command",
-            "Add-Type @'\nusing System;\nusing System.Runtime.InteropServices;\n"
-            "public class U { [DllImport(\"user32.dll\", SetLastError=true)] public static extern bool "
-            "PostMessage(IntPtr h, uint m, IntPtr w, string l); }\n'@; "
-            "[void][U]::PostMessage([IntPtr]0xffff, 0x001A, [IntPtr]::Zero, 'ImmersiveColorSet')",
-        ],
-        timeout=20,
-    )
+    # Alle Fenster/Shell-Komponenten ueber den Theme-Wechsel informieren, damit nicht nur der
+    # Explorer, sondern auch bereits laufende Apps (Taskleiste, Start, Settings, ...) sofort
+    # konsistent umschalten statt in einem gemischten Hell/Dunkel-Zustand zu verharren.
+    _broadcast_setting_change("ImmersiveColorSet")
     return True, "OK"
 
 
@@ -543,10 +567,48 @@ def _run_powershell(script: str, timeout: int = 40) -> str:
     return ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
 
 
+# Aliase -> feste GUIDs. IT-Richtlinien verstecken Einstellungen haeufig vor `powercfg /query`
+# (z. B. Deckel-/Netzschalter-Aktion auf verwalteten Laptop-Images) ueber das "Hidden"-Attribut —
+# der Wert bleibt dabei uebers Registry direkt lesbar; nur die powercfg-Textausgabe blendet ihn aus.
+_POWER_ALIAS_GUIDS: dict[str, str] = {
+    "SUB_BUTTONS": "4f971e89-eebd-4455-a8de-9e59040e7347",
+    "PBUTTONACTION": "7648efa3-dd9c-4e3e-b566-50f929386280",
+    "LIDACTION": "5ca83367-6e45-459f-a27b-476b1d01c936",
+    "SUB_VIDEO": "7516b95f-f776-4464-8c53-06167f40cc99",
+    "VIDEOIDLE": "3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e",
+    "ADAPTBRIGHT": "fbd9aa66-9553-4097-ba44-ed6e9d65eab8",
+    "SUB_SLEEP": "238c9fa8-0aad-41ed-83f4-97be242c8f20",
+    "STANDBYIDLE": "29f6c1db-86da-48c5-9fdb-f2b67b1f44da",
+    "SUB_PROCESSOR": "54533251-82be-4824-96c1-47b60b740d00",
+}
+
+
+def _read_power_setting_index_registry(scheme: str, subgroup: str, setting: str, *, ac: bool) -> int | None:
+    """Liest ACSettingIndex/DCSettingIndex direkt aus der Registry — findet auch Werte, die per
+    Richtlinie vor `powercfg /query` versteckt sind (z. B. Deckel-/Netzschalter-Aktion auf manchen
+    Firmen-Notebook-Images)."""
+    if winreg is None or platform.system() != "Windows":
+        return None
+    subgroup_guid = _POWER_ALIAS_GUIDS.get(subgroup.upper(), subgroup)
+    setting_guid = _POWER_ALIAS_GUIDS.get(setting.upper(), setting)
+    path = (
+        rf"SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\{scheme}\{subgroup_guid}\{setting_guid}"
+    )
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
+            value, _ = winreg.QueryValueEx(key, "ACSettingIndex" if ac else "DCSettingIndex")
+        return int(value)
+    except OSError:
+        return None
+
+
 def _read_power_setting_index(subgroup: str, setting: str, *, ac: bool) -> int | None:
     scheme = active_power_scheme_guid()
     if not scheme:
         return None
+    reg_idx = _read_power_setting_index_registry(scheme, subgroup, setting, ac=ac)
+    if reg_idx is not None:
+        return reg_idx
     block = _query_power_line(subgroup, setting, scheme)
     if not block:
         return None
@@ -583,6 +645,34 @@ def _set_power_setting_index(subgroup: str, setting: str, *, ac: bool, value: in
     return True, "OK"
 
 
+# Windows-11-"Energiemodus"-Schieberegler (separat pro Eingesteckt/Akku, sichtbar unter
+# Einstellungen > System > Strom und Akku > Energiestatus). Anders als das klassische
+# Energieschema (Balanced/High Performance GUID, siehe oben) ist das ein Wert-Paar INNERHALB
+# des aktiven Schemas unter SUB_PROCESSOR — undokumentiert, aber auf allen getesteten
+# Windows-11-Builds stabil und per Registry (versteckt vor `powercfg /query`) sowie
+# `powercfg /setacvalueindex` lesbar/schreibbar. Beide GUIDs muessen synchron gesetzt werden,
+# sonst laufen UI-Anzeige und tatsaechliches Verhalten auseinander.
+_POWER_MODE_GUID_PRIMARY = "36687f9e-e3a5-4dbf-b1dc-15eb381c6863"
+_POWER_MODE_GUID_SECONDARY = "36687f9e-e3a5-4dbf-b1dc-15eb381c6864"
+
+_POWER_MODE_TARGETS: dict[str, int] = {
+    "best_performance": 0,
+    "balanced": 50,
+    "best_efficiency": 100,
+}
+
+
+def _power_mode_label(idx: int) -> str:
+    # Grenzen empirisch ermittelt (nicht offiziell dokumentiert): Index 33 zeigt sich in der
+    # Windows-Einstellungen-UI als "Beste Leistung", Index 50 als "Ausbalanciert" — die Mitte
+    # zwischen den drei von uns geschriebenen Zielwerten (0/50/100) liegt also bei 40 bzw. 75.
+    if idx < 40:
+        return "Beste Leistung"
+    if idx < 75:
+        return "Ausbalanciert"
+    return "Beste Energieeffizienz"
+
+
 def read_power_mode_ac_dc() -> tuple[SettingState, SettingState]:
     if platform.system() != "Windows":
         na = _state("Nicht verfügbar", False, "Nur unter Windows.")
@@ -591,29 +681,77 @@ def read_power_mode_ac_dc() -> tuple[SettingState, SettingState]:
     if not active:
         na = _state("Nicht verfügbar", False, "Aktives Energieschema nicht lesbar.")
         return na, na
-    if _guid_matches(active, GUID_HIGH):
-        mode = "Beste Leistung"
-    elif _guid_matches(active, GUID_BALANCED):
-        mode = "Ausbalanciert"
-    else:
-        mode = "Energiesparmodus/Benutzerdefiniert"
-    st = _state(mode, True, f"Aktives Schema: {active}")
-    return st, st
+    # Der Energiemodus-Regler ist undokumentiert und existiert je nach Windows-Version/-Build
+    # unterschiedlich (neu ab Windows 11, teils zurueckportiert nach Windows 10). Lesefehler auf
+    # abweichenden Systemen sollen nie hochgereicht werden, sondern immer auf den robusten
+    # Einzelschema-Fallback zurueckfallen.
+    try:
+        idx_ac = _read_power_setting_index("SUB_PROCESSOR", _POWER_MODE_GUID_PRIMARY, ac=True)
+        idx_dc = _read_power_setting_index("SUB_PROCESSOR", _POWER_MODE_GUID_PRIMARY, ac=False)
+    except Exception:  # pylint: disable=broad-except
+        idx_ac = idx_dc = None
+    if idx_ac is None or idx_dc is None:
+        # Energiemodus-Regler auf diesem System nicht verfuegbar (z. B. aeltere Windows-10-Builds) —
+        # Fallback auf das aktive Energieschema, das dann fuer AC/DC identisch angezeigt wird.
+        if _guid_matches(active, GUID_HIGH):
+            mode = "Beste Leistung"
+        elif _guid_matches(active, GUID_BALANCED):
+            mode = "Ausbalanciert"
+        else:
+            mode = "Energiesparmodus/Benutzerdefiniert"
+        st = _state(mode, True, f"Aktives Schema: {active}")
+        return st, st
+    return (
+        _state(_power_mode_label(idx_ac), True, f"Index={idx_ac}"),
+        _state(_power_mode_label(idx_dc), True, f"Index={idx_dc}"),
+    )
+
+
+def apply_power_mode(ac: bool, level: str) -> tuple[bool, str]:
+    if platform.system() != "Windows":
+        return False, "Nur unter Windows."
+    idx = _POWER_MODE_TARGETS.get((level or "").strip().lower())
+    if idx is None:
+        return False, f"Unbekannte Energiemodus-Stufe: {level}"
+    try:
+        ok1, msg1 = _set_power_setting_index("SUB_PROCESSOR", _POWER_MODE_GUID_PRIMARY, ac=ac, value=idx)
+        ok2, msg2 = _set_power_setting_index("SUB_PROCESSOR", _POWER_MODE_GUID_SECONDARY, ac=ac, value=idx)
+    except Exception as exc:  # pylint: disable=broad-except
+        # Auf Systemen ohne diesen Regler (z. B. aeltere Windows-10-Builds) soll ein unerwarteter
+        # powercfg-Fehler nie den Aufrufer crashen, sondern sauber als "nicht verfuegbar" zurueckkommen.
+        return False, f"Energiemodus auf diesem System nicht verfuegbar: {exc}"
+    if not ok1 and not ok2:
+        return False, msg1 or msg2
+    return True, "OK"
+
+
+class _SystemPowerStatus(ctypes.Structure):
+    _fields_ = [
+        ("ACLineStatus", ctypes.c_ubyte),
+        ("BatteryFlag", ctypes.c_ubyte),
+        ("BatteryLifePercent", ctypes.c_ubyte),
+        ("SystemStatusFlag", ctypes.c_ubyte),
+        ("BatteryLifeTime", ctypes.c_ulong),
+        ("BatteryFullLifeTime", ctypes.c_ulong),
+    ]
 
 
 def read_battery_percent() -> SettingState:
     if platform.system() != "Windows":
         return _state("Nicht verfügbar", False, "Nur unter Windows.")
-    text = _run_powershell(
-        "(Get-CimInstance Win32_Battery | Select-Object -First 1 -ExpandProperty EstimatedChargeRemaining) | Out-String"
-    )
-    m = re.search(r"(\d{1,3})", text)
-    if not m:
-        return _state("Nicht verfügbar", False, "Kein Akku oder keine Sensordaten.")
+    # GetSystemPowerStatus statt WMI Win32_Battery: Win32_Battery.EstimatedChargeRemaining wird vom
+    # ACPI-Subsystem oft nur alle paar Minuten aktualisiert und kann daher spuerbar hinter dem
+    # Taskleisten-Symbol zurueckliegen. GetSystemPowerStatus ist dieselbe Win32-API, die auch die
+    # Windows-Taskleiste fuer ihr Akkusymbol nutzt, und liefert deshalb einen konsistenten Wert.
     try:
-        val = max(0, min(int(m.group(1)), 100))
-    except ValueError:
-        return _state("Nicht verfügbar", False, "Akkustand nicht auswertbar.")
+        status = _SystemPowerStatus()
+        if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status)):
+            raise OSError("GetSystemPowerStatus fehlgeschlagen")
+        if status.BatteryFlag == 128 or status.BatteryLifePercent == 255:
+            return _state("Nicht verfügbar", False, "Kein Akku erkannt.")
+        val = max(0, min(int(status.BatteryLifePercent), 100))
+    except Exception as exc:  # pylint: disable=broad-except
+        return _state("Nicht verfügbar", False, f"Akkustand nicht lesbar: {exc}")
     return _state(f"{val}%")
 
 
@@ -625,9 +763,21 @@ def read_show_battery_percent_state() -> ToggleReadResult:
             winreg.HKEY_CURRENT_USER,
             r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
         ) as key:
+            # Windows 11 (ab ca. 23H2) hat einen nativen Taskleisten-Schalter "Akkuprozentsatz
+            # anzeigen" bekommen, der ueber IsBatteryPercentageEnabled gesteuert wird. Das aeltere
+            # ShowBatteryPercentageOnTaskbar (frueherer Registry-Workaround vor dem nativen Support)
+            # existiert auf aktuellen Builds oft noch als Karteileiche mit veraltetem Wert und wird
+            # vom System nicht mehr ausgewertet — deshalb zuerst den neuen Wert pruefen.
+            try:
+                value, _ = winreg.QueryValueEx(key, "IsBatteryPercentageEnabled")
+                return ToggleReadResult(True, int(value) == 1, detail=f"IsBatteryPercentageEnabled={int(value)}")
+            except FileNotFoundError:
+                pass
             value, _ = winreg.QueryValueEx(key, "ShowBatteryPercentageOnTaskbar")
         return ToggleReadResult(True, int(value) == 1, detail=f"ShowBatteryPercentageOnTaskbar={int(value)}")
-    except OSError:
+    except (OSError, ValueError, TypeError):
+        # ValueError/TypeError zusaetzlich zu OSError: auf manchen Windows-Versionen/-Builds kann
+        # der Wertetyp der Registry-Eintraege abweichen (z. B. REG_SZ statt REG_DWORD).
         return ToggleReadResult(False, False, "Nicht verfügbar (abhängig von Windows-Version).")
 
 
@@ -641,7 +791,11 @@ def apply_show_battery_percent_state(enable: bool) -> tuple[bool, str]:
             0,
             winreg.KEY_SET_VALUE,
         ) as key:
-            winreg.SetValueEx(key, "ShowBatteryPercentageOnTaskbar", 0, winreg.REG_DWORD, 1 if enable else 0)
+            val = 1 if enable else 0
+            # Beide Werte setzen: IsBatteryPercentageEnabled fuer aktuelle Windows-11-Builds,
+            # ShowBatteryPercentageOnTaskbar als Fallback fuer aeltere Windows-10-Systeme.
+            winreg.SetValueEx(key, "IsBatteryPercentageEnabled", 0, winreg.REG_DWORD, val)
+            winreg.SetValueEx(key, "ShowBatteryPercentageOnTaskbar", 0, winreg.REG_DWORD, val)
         return True, "OK"
     except OSError as exc:
         return False, str(exc)

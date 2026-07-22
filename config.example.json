@@ -243,6 +243,7 @@
       "search_terms": ["firefox", "mozilla firefox"]
     }
   },
+  "custom_software": [],
   "chocolatey_source": {
     "name": "chocolatey",
     "url": "https://community.chocolatey.org/api/v2/"
@@ -258,20 +259,22 @@
     "prefer_local": true
   },
   "system_settings": {
-    "display_timeout_seconds": 30,
-    "sleep_timeout_minutes": 3,
+    "display_timeout_seconds": 0,
+    "sleep_timeout_minutes": 0,
     "power_profile": "balanced",
-    "dark_mode_enabled": false,
-    "screensaver_disabled": false,
-    "show_battery_percent": false,
+    "dark_mode_enabled": true,
+    "screensaver_disabled": true,
+    "show_battery_percent": true,
     "ac_lid_action": "none",
-    "dc_lid_action": "sleep",
+    "dc_lid_action": "none",
     "ac_power_button_action": "sleep",
     "dc_power_button_action": "sleep",
-    "ac_standby_disabled": false,
-    "dc_standby_disabled": false,
-    "adaptive_brightness_enabled": false,
-    "usb_power_saving_enabled": true
+    "ac_standby_disabled": true,
+    "dc_standby_disabled": true,
+    "adaptive_brightness_enabled": true,
+    "usb_power_saving_enabled": true,
+    "ac_power_mode": "best_performance",
+    "dc_power_mode": "balanced"
   },
   "ui_columns": {
     "checkbox": 44,

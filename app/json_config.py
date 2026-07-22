@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -65,6 +66,7 @@ DEFAULT_EXAMPLE_CONFIG: dict[str, Any] = {
         },
     },
     "software_providers": {},
+    "custom_software": [],
     "local_source": {
         "last_path": "",
         "prefer_local": True,
@@ -140,6 +142,7 @@ class RuntimeSettings:
     enabled_software_keys: frozenset[str] | None
     chocolatey_source: ChocolateySourceConfig | None
     visible_catalog: tuple[Any, ...]
+    custom_software_keys: frozenset[str]
     software_providers: dict[str, Any]
     office_tools: dict[str, Any]
     local_source_last_path: str
@@ -302,6 +305,133 @@ def _parse_enabled_keys(raw: Any) -> frozenset[str] | None:
     return selected
 
 
+def _slugify_software_key(name: str, taken: set[str]) -> str:
+    base = re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_") or "custom_app"
+    key = base
+    i = 2
+    while key in taken:
+        key = f"{base}_{i}"
+        i += 1
+    return key
+
+
+def _parse_custom_software(raw: Any) -> tuple[SoftwarePackage, ...]:
+    """Vom Nutzer per UI hinzugefuegte Programme (config.json: custom_software) — im Gegensatz zu
+    SOFTWARE_CATALOG kein Code-Eintrag noetig, nur Anzeigename + WinGet-ID und/oder Choco-Paket."""
+    if not isinstance(raw, list):
+        return ()
+    seen: set[str] = {s.key for s in SOFTWARE_CATALOG}
+    out: list[SoftwarePackage] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        display_name = str(item.get("display_name", "") or "").strip()
+        choco_pkg = str(item.get("choco_package", "") or "").strip()
+        winget_id = str(item.get("winget_id", "") or "").strip()
+        if not display_name or (not choco_pkg and not winget_id):
+            continue
+        terms_raw = item.get("search_terms")
+        if isinstance(terms_raw, list) and terms_raw:
+            terms = tuple(str(x).strip() for x in terms_raw if str(x).strip())
+        else:
+            terms = (display_name.lower(),)
+        key = str(item.get("key", "") or "").strip()
+        if not key or key in seen:
+            key = _slugify_software_key(display_name, seen)
+        seen.add(key)
+        out.append(
+            SoftwarePackage(
+                key=key,
+                display_name=display_name,
+                primary_package=choco_pkg or None,
+                search_terms=terms or (display_name.lower(),),
+                registry_keywords=terms or (display_name.lower(),),
+                winget_id=winget_id or None,
+            )
+        )
+    return tuple(out)
+
+
+def add_custom_software(
+    cfg: dict[str, Any],
+    *,
+    display_name: str,
+    winget_id: str = "",
+    choco_package: str = "",
+    search_terms: list[str] | None = None,
+    logger: logging.Logger | None = None,
+) -> tuple[bool, str, SoftwarePackage | None]:
+    """Fuegt ein vom Nutzer angegebenes Programm zu config.json hinzu und gibt das fertige
+    SoftwarePackage zurueck, damit die UI die neue Zeile sofort ohne Neustart anzeigen kann."""
+    display_name = display_name.strip()
+    winget_id = winget_id.strip()
+    choco_package = choco_package.strip()
+    if not display_name:
+        return False, "Anzeigename fehlt.", None
+    if not winget_id and not choco_package:
+        return False, "WinGet-ID oder Chocolatey-Paketname angeben.", None
+    existing = cfg.get("custom_software")
+    if not isinstance(existing, list):
+        existing = []
+    taken = {s.key for s in SOFTWARE_CATALOG} | {
+        str(e.get("key", "")) for e in existing if isinstance(e, dict) and e.get("key")
+    }
+    key = _slugify_software_key(display_name, taken)
+    terms = [t.strip() for t in (search_terms or []) if t.strip()] or [display_name.lower()]
+    existing.append(
+        {
+            "key": key,
+            "display_name": display_name,
+            "winget_id": winget_id,
+            "choco_package": choco_package,
+            "search_terms": terms,
+        }
+    )
+    cfg["custom_software"] = existing
+    save_config_dict(cfg, logger, backup=False)
+    pkg = SoftwarePackage(
+        key=key,
+        display_name=display_name,
+        primary_package=choco_package or None,
+        search_terms=tuple(terms),
+        registry_keywords=tuple(terms),
+        winget_id=winget_id or None,
+    )
+    return True, "OK", pkg
+
+
+def remove_custom_software(cfg: dict[str, Any], key: str, logger: logging.Logger | None = None) -> bool:
+    existing = cfg.get("custom_software")
+    if not isinstance(existing, list):
+        return False
+    new_list = [e for e in existing if not (isinstance(e, dict) and str(e.get("key", "")) == key)]
+    if len(new_list) == len(existing):
+        return False
+    cfg["custom_software"] = new_list
+    save_config_dict(cfg, logger, backup=False)
+    return True
+
+
+def set_builtin_software_enabled(
+    cfg: dict[str, Any], key: str, enabled: bool, logger: logging.Logger | None = None
+) -> None:
+    """Blendet einen der fest im Code hinterlegten SOFTWARE_CATALOG-Eintraege ein/aus, damit sich
+    auch die 10 Standardprogramme genau wie eigene hinzugefuegte Anwendungen entfernen/wieder
+    hinzufuegen lassen (ueber enabled_standard_software statt Code-Aenderung)."""
+    all_keys = [s.key for s in SOFTWARE_CATALOG]
+    raw = cfg.get("enabled_standard_software")
+    if isinstance(raw, list) and raw:
+        current = {str(x).strip() for x in raw if str(x).strip()}
+    else:
+        current = set(all_keys)  # None/leer bedeutet "alle aktiv" — erst jetzt explizit machen
+    if enabled:
+        current.add(key)
+    else:
+        current.discard(key)
+    cfg["enabled_standard_software"] = [k for k in all_keys if k in current]
+    save_config_dict(cfg, logger, backup=False)
+
+
 def _parse_office_tools(raw: Any) -> dict[str, Any]:
     defaults: dict[str, Any] = {
         "get_help_cmd_path": "",
@@ -427,11 +557,19 @@ def load_runtime_settings(logger: logging.Logger | None = None) -> RuntimeSettin
         visible = tuple(custom_catalog)
         enabled = None
 
+    # Vom Nutzer per "+ Anwendung hinzufuegen" ergaenzte Programme: immer sichtbar, unabhaengig
+    # von enabled_standard_software (das steuert nur die fest eingebauten Katalogeintraege).
+    custom_pkgs = _parse_custom_software(data.get("custom_software"))
+    visible_keys = {s.key for s in visible}
+    visible = visible + tuple(p for p in custom_pkgs if p.key not in visible_keys)
+    custom_software_keys = frozenset(p.key for p in custom_pkgs)
+
     return RuntimeSettings(
         company_name=company_name,
         internal_installers=merged_installers,
         enabled_software_keys=enabled,
         chocolatey_source=choco_source,
+        custom_software_keys=custom_software_keys,
         visible_catalog=visible,
         software_providers=software_providers,
         office_tools=office_tools,

@@ -9,12 +9,36 @@ Set-Location $projectRoot
 
 $distDir = Join-Path $projectRoot "dist\Compexx-InstallTool"
 $distExe = Join-Path $distDir "Compexx-InstallTool.exe"
+# PyInstaller legt bei jedem Onedir-Build zusaetzlich eine verwaiste EXE direkt unter
+# dist\ an (ohne _internal-Ordner). Die startet nicht eigenstaendig und sorgt nur fuer
+# Verwirrung -> nach dem Build immer entfernen.
+$strayExe = Join-Path $projectRoot "dist\Compexx-InstallTool.exe"
+$buildDir = Join-Path $projectRoot "build\Compexx-InstallTool_onedir"
+
+function Remove-DirWithRetry {
+    param([string]$Path, [int]$Retries = 5)
+    for ($i = 0; $i -lt $Retries; $i++) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($i -eq ($Retries - 1)) { throw }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+}
 
 Get-Process -Name "Compexx-InstallTool" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 800
 
 if (Test-Path -LiteralPath $distDir) {
-    Remove-Item -LiteralPath $distDir -Recurse -Force
+    Remove-DirWithRetry -Path $distDir
+}
+if (Test-Path -LiteralPath $buildDir) {
+    Remove-DirWithRetry -Path $buildDir
+}
+if (Test-Path -LiteralPath $strayExe) {
+    Remove-Item -LiteralPath $strayExe -Force -ErrorAction SilentlyContinue
 }
 
 $venvPython = Join-Path $projectRoot ".venv\Scripts\python.exe"
@@ -37,6 +61,10 @@ if ($LASTEXITCODE -ne 0) {
 
 if (-not (Test-Path -LiteralPath $distExe)) {
     throw "Build fehlgeschlagen: $distExe nicht gefunden."
+}
+
+if (Test-Path -LiteralPath $strayExe) {
+    Remove-Item -LiteralPath $strayExe -Force -ErrorAction SilentlyContinue
 }
 
 $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $distExe
