@@ -159,3 +159,11 @@ Bei `*.msi` (oder `type = msi`) wird nativ über `msiexec` installiert:
   - Chocolatey
   - WinGet
   - konfigurierte interne Installer (Pfad/URL in `config.json`)
+
+
+## Support / Bugtracker
+
+Starte `SUPPORT-BUG-MELDEN.cmd` oder öffne:
+`https://mail-hub-production-f6d2.up.railway.app/support/updater`
+
+Die Meldung landet direkt im zentralen Gurgenbaba Office unter **GBB SoftwareUpdate**. Supportkontakt erzeugt keine Newsletter-Einwilligung.
